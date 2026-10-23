@@ -1,0 +1,3513 @@
+---
+title: "Latent-state model of inpatient biomarker trajectories — model selection and final fit"
+author: 'Marco Cecilia'
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+<!--
+=============================================================================
+ STRUCTURE OF THIS NOTEBOOK  (rewritten: response-set BEFORE K)
+=============================================================================
+  0   Configuration
+  1   Libraries, figure/table export helpers
+  2   Data preparation engine (one function, applied to each cohort)
+  3   Model fitting engine (one function, applied to each candidate model)
+  3A  STAGE 1 — response-set justification: 4 clinical axes at K = 4 on the
+      CRP/WBC-inclusive cohort. Shows that the inflammatory axis does not
+      separate states, and fixes the 3-biomarker response set.
+  3B  STAGE 2 — number of states: K in {3, 4, 5} on the FIXED 3-biomarker
+      response set. Fixes K.
+  4   Final model specification      \
+  5   Final model fitting             |
+  6   State decoding                  |  everything from here on uses
+  7   Model visualisation             |  ONE model only: the final
+  8   Estimated parameter summary     |  (response set, K) combination.
+  9   Model checking (pseudo-residuals; NO posterior predictive checks)
+ 10   State-occupancy patterns
+ 11   Uncertainty quantification  [TODO — method to be confirmed]
+ 12   Export bundle                  /
+
+ Every candidate model fitted in 3A / 3B is discarded after its stage.
+ Clinical state labels ("Stable", "Anaemic", "Hepatic", "Renal") are
+ attached ONLY to the final model (Section 5.2); intermediate models are
+ reported with raw state indices, which carry no clinical meaning.
+=============================================================================
+-->
+
+# 0. Configuration
+
+```{r config}
+# ── Clinical axes and candidate response sets ────────────────────────────────
+# The four physiological axes elicited from the clinical investigators are
+# haematological, renal, hepatic and inflammatory. STAGE 1 fits all four and
+# tests whether the inflammatory axis earns its parameters.
+#
+# Names are matched against the columns of the imputed file with a tolerant
+# resolver (see `resolve_names()` in Section 2), so "CRP" will match
+# "CRP (mg/L)", "CRP (mg/dL)", "PCR (mg/L)", etc. Set the exact string here
+# if the resolver reports an ambiguity.
+AXIS_STEMS <- c(haematological = "HGB",
+                renal          = "CREA",
+                hepatic        = "ALT",
+                inflammatory   = "CRP (mg/L)")
+
+# The axis dropped by STAGE 1 (kept as a config value so the notebook states
+# the hypothesis explicitly rather than hard-coding the conclusion).
+AXIS_UNDER_TEST <- "inflammatory"
+
+# Number of states used for the response-set comparison of STAGE 1. Held
+# fixed across response sets so the comparison is like-for-like.
+K_AXIS_TEST <- 4
+
+# Candidate state counts compared in STAGE 2 (deliberately not a full grid:
+# each fit is expensive at this cohort size).
+K_GRID <- c(3, 4, 5)
+
+# ── Covariates on the OBSERVATION model (means only) ─────────────────────────
+# Empty = covariate-free model. Covariates are NOT part of the thesis model:
+# they are used only for cohort description and phenotype stratification.
+OBS_COVARIATES <- character(0)
+
+# ── Z-score normalisation ─────────────────────────────────────────────────────
+APPLY_ZSCORE <- TRUE
+
+# ── Observation model family ──────────────────────────────────────────────────
+# TRUE  -> full multivariate normal (state-specific covariance).
+# FALSE -> independent normals per biomarker (NOT supported by the fitting
+#          engine of Section 3; the thesis model is the MVN one).
+IS_a_MVN <- TRUE
+
+# ── Per-covariate term specification (unused while OBS_COVARIATES is empty) ──
+SPLINE_K_DEFAULT <- 8
+SPLINE_BS        <- "cs"
+COVARIATE_TERMS  <- list("HGB (g/dL)"   = "linear",
+                         "CREA (mg/dL)" = "linear",
+                         "ALT (U/L)"    = "linear")
+
+# ── Random seed ──────────────────────────────────────────────────────────────
+SEED <- 10
+
+# ── NO TRAIN / TEST SPLIT ────────────────────────────────────────────────────
+# Every model in this notebook is fitted on the FULL cohort of its stage.
+# The held-out-patient experiment of the previous version is removed: the
+# thesis reports no out-of-sample analysis, and the 5% hold-out made the
+# estimation cohort (987) inconsistent with the cohort described in
+# Chapter 1 (1039). Kept as a frozen constant only so the export bundle
+# schema stays backwards compatible with hmm_posthoc.Rmd.
+TEST_FRAC <- 0
+
+# ── File paths ───────────────────────────────────────────────────────────────
+# SPEC_* : CRP/WBC-inclusive imputed cohort. Required by STAGE 1, because the
+#          inflammatory axis only exists in this file.
+SPEC_DATA_PATH      <- "df_imputed_wide_log1p_HgbCreaAltWbcCrp.csv"
+SPEC_DECISIONS_PATH <- "bm_log1p_decisions_HgbCreaAltWbcCrp.csv"
+
+# FULL_* : the HGB/CREA/ALT imputed cohort described in Chapter 1.
+FULL_DATA_PATH      <- "df_imputed_wide_log1p_HgbCreaAlt.csv"
+FULL_DECISIONS_PATH <- "bm_log1p_decisions_HgbCreaAlt.csv"
+
+# Clinical reference intervals extracted by Final_pipeline.ipynb.
+REF_RANGES_PATH     <- "biomarker_reference_ranges.csv"
+
+# ── Which cohort carries each stage ──────────────────────────────────────────
+# STAGE 1 always runs on the CRP/WBC-inclusive cohort (it has to).
+#
+# K_SELECTION_COHORT and FINAL_COHORT:
+#   "full" -> the Chapter-1 cohort (FULL_DATA_PATH)
+#   "spec" -> the CRP/WBC-inclusive subcohort (SPEC_DATA_PATH)
+#
+# Default "full": K and the final model are properties of the model reported
+# in the thesis, and that model is fitted on the cohort Chapter 1 describes.
+# The CRP/WBC subcohort then enters the thesis only as the (smaller, nested)
+# sample on which the response set was chosen, which is stated once in
+# Section 3.3 of the chapter. Set both to "spec" to run every stage on the
+# CRP/WBC cohort instead.
+K_SELECTION_COHORT <- "full"
+FINAL_COHORT       <- "full"
+
+# ── Clinical state labels for the FINAL model only ───────────────────────────
+# Assigned automatically in Section 5.2 from the estimated state means, then
+# printed for verification. Nothing here is applied to the candidate models
+# of Sections 3A / 3B.
+#
+# Rule (K = 4): the state with the highest creatinine mean is "Renal", the
+# state with the highest ALT mean among the rest is "Hepatic", the state
+# with the lowest haemoglobin mean among the rest is "Anaemic", and the
+# remaining state is "Stable". The previous label "Weak state" is retired:
+# it conflated the anaemia-dominant and the hepatic states.
+STATE_LABEL_ORDER   <- c("Stable state", "Anaemic state",
+                         "Hepatic state", "Renal state")
+STATE_PALETTE_CUSTOM <- c(
+  "#579D1CFF",   # Stable state
+  "#004586FF",   # Anaemic state
+  "#FF950EFF",   # Hepatic state
+  "#C5000BFF"    # Renal state
+)
+# Set to a named list ("1" = "...", ...) to override the automatic assignment.
+STATE_LABELS_MAP_OVERRIDE <- NULL
+
+# ── Smoke test ───────────────────────────────────────────────────────────────
+# > 0 keeps only the first SMOKE_TEST_N patients of each file, so the whole
+# notebook can be knitted end to end in minutes to check that it runs.
+# ALWAYS set back to 0 before producing anything for the thesis: every number
+# and every figure produced under a smoke test is meaningless.
+SMOKE_TEST_N <- 0
+
+# ── Output directory for figures and tables ──────────────────────────────────
+FIG_DIR <- "figures"
+
+# Derived flag
+has_covariates <- length(OBS_COVARIATES) > 0
+cat("Covariate-augmented observation model:", has_covariates, "\n")
+if (has_covariates) cat("Covariates:", paste(OBS_COVARIATES, collapse = ", "), "\n")
+stopifnot(IS_a_MVN)
+```
+
+---
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(hmmTMB)
+library(patchwork)
+library(mvtnorm)
+
+theme_set(theme_bw())
+pal <- hmmTMB:::hmmTMB_cols
+```
+
+## 1.1 Figure and table export helpers
+
+Every figure and table referenced by Chapter 3 is written to `FIG_DIR` as a
+file, so the thesis includes artefacts produced by this run and not
+screenshots.
+
+```{r export-helpers}
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Save a ggplot / patchwork object as PNG (+ PDF for LaTeX inclusion).
+save_fig <- function(plot, name, width = 10, height = 6, dpi = 300) {
+  png_path <- file.path(FIG_DIR, paste0(name, ".png"))
+  pdf_path <- file.path(FIG_DIR, paste0(name, ".pdf"))
+  ggplot2::ggsave(png_path, plot = plot, width = width, height = height,
+                  dpi = dpi, bg = "white")
+  try(ggplot2::ggsave(pdf_path, plot = plot, width = width, height = height,
+                      device = cairo_pdf, bg = "white"), silent = TRUE)
+  cat("[figure] ", png_path, "\n", sep = "")
+  invisible(png_path)
+}
+
+# Save a data frame as CSV and echo it into the knitted document.
+save_tab <- function(df, name, caption = NULL, digits = 3) {
+  csv_path <- file.path(FIG_DIR, paste0(name, ".csv"))
+  readr::write_csv(df, csv_path)
+  cat("[table]  ", csv_path, "\n", sep = "")
+  if (!is.null(caption)) cat(caption, "\n", sep = "")
+  print(as.data.frame(df |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                                        \(x) round(x, digits)))),
+        row.names = FALSE)
+  invisible(csv_path)
+}
+```
+
+---
+
+# 2. Data preparation engine
+
+The previous version of this notebook hard-wired one data file and one
+response set into the top-level chunks. Two cohorts are now needed (the
+CRP/WBC-inclusive one for the response-set comparison, the Chapter-1 one for
+the final model), so the whole load-and-preprocess block is wrapped in a
+single function and called once per cohort. The body is the original code of
+Sections 2 and 3.1--3.5, unchanged in substance: sequential patient IDs,
+mgcv-safe column names, z-scoring with stored parameters, log1p
+back-transform decisions, and the clinical reference intervals.
+
+## 2.1 Reference intervals (cohort-independent)
+
+```{r reference-intervals-global}
+if (file.exists(REF_RANGES_PATH)) {
+  ref_raw <- readr::read_csv(REF_RANGES_PATH, show_col_types = FALSE) |>
+    dplyr::filter(!is.na(lln), !is.na(uln), uln > lln)
+
+  if (any(ref_raw$n_distinct_ranges > 1))
+    message("Reference ranges resolved from multiple clinician-entered variants ",
+            "(weighted average) for: ",
+            paste(ref_raw$biomarker[ref_raw$n_distinct_ranges > 1], collapse = ", "))
+
+  REF_INTERVALS <- setNames(
+    Map(function(l, u) c(l, u), ref_raw$lln, ref_raw$uln),
+    ref_raw$biomarker
+  )
+} else {
+  warning("REF_RANGES_PATH not found (", REF_RANGES_PATH,
+          "); reference bands/columns will be omitted.")
+  REF_INTERVALS <- list()
+}
+
+# [LLN, ULN] treated as the central 95% reference interval -> mean +/- 1.96 SD.
+REF_COVERAGE_Z <- 1.96
+
+CATEGORICAL_COVS <- c("hospital_ward", "sex", "admission_reason",
+                      "treatment_target", "ECOG",
+                      "discharge_mode", "discharge_dead", "discharged_alive",
+                      "admission_start_date", "admission_end_date",
+                      "solid_tumor_category", "discharge_mortality_90d")
+```
+
+## 2.2 The preparation function
+
+```{r prep-function}
+# Resolve a biomarker stem ("CRP") to the actual column name in a data set
+# ("CRP (mg/L)"). Errors loudly on 0 or >1 matches rather than guessing.
+resolve_names <- function(stems, available) {
+  vapply(stems, function(s) {
+    hit <- available[startsWith(toupper(available), toupper(s))]
+    if (length(hit) == 0)
+      stop("Biomarker stem '", s, "' matches no column. Available: ",
+           paste(available, collapse = " | "))
+    if (length(hit) > 1)
+      stop("Biomarker stem '", s, "' is ambiguous, matches: ",
+           paste(hit, collapse = " | "),
+           ". Put the exact column name in AXIS_STEMS.")
+    hit
+  }, character(1))
+}
+
+build_analysis_data <- function(data_path, decisions_path, axis_stems,
+                                label = basename(data_path)) {
+
+  if (!file.exists(data_path))
+    stop("Data file not found: ", data_path)
+  if (!file.exists(decisions_path))
+    stop("log1p-decisions file not found: ", decisions_path)
+
+  df_raw <- readr::read_csv(data_path, show_col_types = FALSE)
+
+  if (SMOKE_TEST_N > 0) {
+    keep_ids <- head(sort(unique(df_raw$patient_id)), SMOKE_TEST_N)
+    df_raw <- df_raw[df_raw$patient_id %in% keep_ids, , drop = FALSE]
+    cat("*** SMOKE TEST: ", data_path, " truncated to ", length(keep_ids),
+        " patients. Results are NOT usable. ***\n", sep = "")
+  }
+
+  # ---- column groups (identical to the original Section 2) ----------------
+  cov_cols <- c(
+    "admission_start_date", "admission_end_date",
+    "sex", "hospital_ward", "age", "pack_years_smoking", "alcohol_years",
+    "length_of_stay_days", "days_in_ER", "ER_last_day",
+    "admissions_last_12m", "admissions_last_6m",
+    "ECOG", "Barthel_index", "Braden_score", "CIRS_total_score",
+    "admission_reason", "discharge_dead", "discharge_mode", "discharged_alive",
+    "solid_tumor_category",
+    "date_of_death", "is_dead",
+    "discharge_mortality_90d", "days_death_from_admission",
+    "days_death_from_discharge"
+  )
+  id_cols  <- c("patient_id", "analysis_date", "day")
+  bio_cols <- setdiff(names(df_raw), c(id_cols, cov_cols))
+
+  df_raw <- df_raw |>
+    dplyr::mutate(dplyr::across(
+      dplyr::all_of(intersect(CATEGORICAL_COVS, names(df_raw))), as.factor))
+
+  # ---- resolve the requested axes to real column names --------------------
+  RESPONSE_VARS <- unname(resolve_names(axis_stems, bio_cols))
+  names(RESPONSE_VARS) <- names(axis_stems)
+
+  missing_cov <- setdiff(OBS_COVARIATES, names(df_raw))
+  if (length(missing_cov) > 0)
+    stop("Configured covariates not found in ", label, ": ",
+         paste(missing_cov, collapse = ", "))
+
+  patient_ids <- sort(unique(df_raw$patient_id))
+
+  cat("\n== Cohort: ", label, " ==\n", sep = "")
+  cat("  file                  : ", data_path, "\n", sep = "")
+  cat("  rows                  : ", nrow(df_raw), "\n", sep = "")
+  cat("  patients              : ", length(patient_ids), "\n", sep = "")
+  cat("  days                  : ", dplyr::n_distinct(df_raw$day),
+      " (", min(df_raw$day), "..", max(df_raw$day), ")\n", sep = "")
+  cat("  biomarker columns     : ", length(bio_cols), "\n", sep = "")
+  cat("  response variables    : ", paste(RESPONSE_VARS, collapse = ", "), "\n", sep = "")
+
+  # ---- sequential patient ID (original Section 3.1) -----------------------
+  patient_map <- df_raw |>
+    dplyr::distinct(patient_id) |>
+    dplyr::arrange(patient_id) |>
+    dplyr::mutate(ID = as.factor(dplyr::row_number()))
+
+  df <- df_raw |>
+    dplyr::left_join(patient_map, by = "patient_id") |>
+    dplyr::relocate(ID, .before = 1) |>
+    dplyr::arrange(ID, day) |>
+    dplyr::rename(time = day)
+
+  id_lookup <- df |> dplyr::distinct(ID, patient_id)
+  df <- df |> dplyr::select(-patient_id)
+
+  # ---- mgcv-safe names (original Section 3.2) -----------------------------
+  make_safe_names <- function(orig) {
+    if (length(orig) == 0) return(character(0))
+    base <- gsub("[^A-Za-z0-9]+", "_", orig)
+    base <- gsub("^_+|_+$", "", base)
+    base[base == ""] <- "var"
+    make.unique(paste0("v_", base), sep = "_")
+  }
+  all_orig        <- c(unname(RESPONSE_VARS), OBS_COVARIATES)
+  all_safe        <- make_safe_names(all_orig)
+  display_to_safe <- setNames(all_safe, all_orig)
+  safe_to_display <- setNames(all_orig, all_safe)
+
+  rename_vec <- setNames(names(display_to_safe), as.character(display_to_safe))
+  df <- df |> dplyr::rename(!!!rename_vec)
+
+  RESPONSE_VARS_SAFE  <- unname(display_to_safe[unname(RESPONSE_VARS)])
+  names(RESPONSE_VARS_SAFE) <- names(RESPONSE_VARS)
+  OBS_COVARIATES_SAFE <- unname(display_to_safe[OBS_COVARIATES])
+
+  display     <- function(safe_name)  unname(safe_to_display[safe_name])
+  display_vec <- function(safe_names) unname(safe_to_display[safe_names])
+
+  # ---- z-scoring (original Section 3.3) -----------------------------------
+  numeric_covariates_safe <- OBS_COVARIATES_SAFE[
+    vapply(OBS_COVARIATES_SAFE, function(s) is.numeric(df[[s]]), logical(1))
+  ]
+  cols_to_zscore <- c(unname(RESPONSE_VARS_SAFE), numeric_covariates_safe)
+
+  zscore_params <- df |>
+    dplyr::summarise(dplyr::across(
+      dplyr::all_of(cols_to_zscore),
+      list(mean = \(x) mean(x, na.rm = TRUE), sd = \(x) sd(x, na.rm = TRUE)),
+      .names = "{.col}__{.fn}")) |>
+    tidyr::pivot_longer(dplyr::everything(),
+                        names_to = c("biomarker", ".value"), names_sep = "__")
+
+  if (APPLY_ZSCORE) {
+    df <- df |>
+      dplyr::mutate(dplyr::across(
+        dplyr::all_of(cols_to_zscore),
+        ~ (. - mean(., na.rm = TRUE)) / sd(., na.rm = TRUE)))
+    cat("  z-score applied to    : ",
+        paste(unname(RESPONSE_VARS), collapse = ", "), "\n", sep = "")
+  }
+
+  inv_zscore <- function(z_vals, biomarker_safe) {
+    if (!APPLY_ZSCORE) return(z_vals)
+    row <- zscore_params[zscore_params$biomarker == biomarker_safe, ]
+    z_vals * row$sd + row$mean
+  }
+
+  # ---- log1p decisions (original Section 3.4) -----------------------------
+  bm_decisions <- readr::read_csv(decisions_path, show_col_types = FALSE) |>
+    dplyr::filter(biomarker %in% unname(RESPONSE_VARS)) |>
+    dplyr::select(biomarker, apply_log1p)
+
+  bm_decisions$biomarker_safe <- display_to_safe[bm_decisions$biomarker]
+  needs_expm1 <- setNames(bm_decisions$apply_log1p, bm_decisions$biomarker_safe)
+  # Any response variable absent from the decisions file is treated as
+  # untransformed, and that is reported rather than silently assumed.
+  absent <- setdiff(unname(RESPONSE_VARS_SAFE), names(needs_expm1))
+  if (length(absent) > 0) {
+    warning("No log1p decision found for: ",
+            paste(display_vec(absent), collapse = ", "),
+            " -- treated as untransformed.")
+    for (a in absent) needs_expm1[[a]] <- FALSE
+  }
+  cat("  log1p-transformed     : ",
+      paste(display_vec(names(needs_expm1))[unlist(needs_expm1)],
+            collapse = ", "), "\n", sep = "")
+
+  to_clinical <- function(values, biomarker_safe) {
+    v <- inv_zscore(values, biomarker_safe)
+    if (isTRUE(needs_expm1[[biomarker_safe]])) v <- expm1(v)
+    v
+  }
+
+  to_clinical_sd <- function(sd_values, biomarker_safe, mu_logscale = NULL) {
+    s <- sd_values
+    if (APPLY_ZSCORE) {
+      row <- zscore_params[zscore_params$biomarker == biomarker_safe, ]
+      s <- s * row$sd
+    }
+    if (isTRUE(needs_expm1[[biomarker_safe]])) {
+      if (is.null(mu_logscale))
+        stop("to_clinical_sd(): `mu_logscale` required for log1p biomarker '",
+             display(biomarker_safe), "'.")
+      mu_log <- if (APPLY_ZSCORE) {
+        row <- zscore_params[zscore_params$biomarker == biomarker_safe, ]
+        mu_logscale * row$sd + row$mean
+      } else mu_logscale
+      var_clin <- (exp(s^2) - 1) * exp(2 * mu_log + s^2)
+      s <- sqrt(var_clin)
+    }
+    s
+  }
+
+  axis_label <- function(biomarker_safe) {
+    disp <- display(biomarker_safe)
+    bits <- character()
+    if (isTRUE(needs_expm1[[biomarker_safe]])) bits <- c(bits, "back-transformed from log1p")
+    if (APPLY_ZSCORE)                          bits <- c(bits, "model on z-scores")
+    if (length(bits) == 0) disp else paste0(disp, " (", paste(bits, collapse = "; "), ")")
+  }
+
+  global_scale_subtitle <- function() {
+    any_log1p <- any(unlist(needs_expm1))
+    if (any_log1p && APPLY_ZSCORE)
+      "Clinical scale (back-transformed from z-score and log1p where applicable)"
+    else if (any_log1p) "Clinical scale (back-transformed from log1p where applicable)"
+    else if (APPLY_ZSCORE) "Clinical scale (back-transformed from z-score)"
+    else "Raw input scale"
+  }
+
+  # ---- reference-interval helpers (original Section 3.4b) -----------------
+  ref_mean_sd <- function(display_name) {
+    iv <- REF_INTERVALS[[display_name]]
+    if (is.null(iv)) return(NULL)
+    list(mean = mean(iv), sd = (iv[2] - iv[1]) / (2 * REF_COVERAGE_Z),
+         lln = iv[1], uln = iv[2])
+  }
+  ref_by_safe <- function(biomarker_safe) ref_mean_sd(display(biomarker_safe))
+
+  to_model <- function(x_clin, biomarker_safe) {
+    x <- if (isTRUE(needs_expm1[[biomarker_safe]])) log1p(x_clin) else x_clin
+    if (APPLY_ZSCORE) {
+      row <- zscore_params[zscore_params$biomarker == biomarker_safe, ]
+      x <- (x - row$mean) / row$sd
+    }
+    x
+  }
+
+  list(
+    label = label, data_path = data_path,
+    df = df, bio_cols = bio_cols, id_lookup = id_lookup,
+    patient_ids = patient_ids,
+    n_patients = length(patient_ids), n_rows = nrow(df),
+    RESPONSE_VARS = RESPONSE_VARS, RESPONSE_VARS_SAFE = RESPONSE_VARS_SAFE,
+    OBS_COVARIATES_SAFE = OBS_COVARIATES_SAFE,
+    display_to_safe = display_to_safe, safe_to_display = safe_to_display,
+    display = display, display_vec = display_vec,
+    zscore_params = zscore_params, inv_zscore = inv_zscore,
+    needs_expm1 = needs_expm1,
+    to_clinical = to_clinical, to_clinical_sd = to_clinical_sd,
+    axis_label = axis_label, global_scale_subtitle = global_scale_subtitle,
+    ref_mean_sd = ref_mean_sd, ref_by_safe = ref_by_safe, to_model = to_model
+  )
+}
+
+# Promote one prepared cohort to the global names used by Sections 4-12.
+# Everything downstream of the final fit reads these globals, exactly as in
+# the original notebook.
+use_dataset <- function(D, response_safe = NULL) {
+  keep <- c("df", "bio_cols", "RESPONSE_VARS", "RESPONSE_VARS_SAFE",
+            "OBS_COVARIATES_SAFE", "display_to_safe", "safe_to_display",
+            "display", "display_vec", "zscore_params", "inv_zscore",
+            "needs_expm1", "to_clinical", "to_clinical_sd", "axis_label",
+            "global_scale_subtitle", "ref_mean_sd", "ref_by_safe", "to_model",
+            "id_lookup")
+  list2env(D[keep], envir = globalenv())
+  if (!is.null(response_safe)) {
+    assign("RESPONSE_VARS_SAFE", unname(response_safe), envir = globalenv())
+    assign("RESPONSE_VARS",
+           unname(D$safe_to_display[response_safe]), envir = globalenv())
+  }
+  invisible(TRUE)
+}
+```
+
+## 2.3 Build the cohorts
+
+```{r build-cohorts}
+AXIS_FINAL <- setdiff(names(AXIS_STEMS), AXIS_UNDER_TEST)
+
+data_spec <- build_analysis_data(
+  SPEC_DATA_PATH, SPEC_DECISIONS_PATH, AXIS_STEMS,
+  label = "CRP/WBC-inclusive (4 axes)")
+
+have_full <- file.exists(FULL_DATA_PATH) && file.exists(FULL_DECISIONS_PATH)
+if (have_full) {
+  data_full <- build_analysis_data(
+    FULL_DATA_PATH, FULL_DECISIONS_PATH, AXIS_STEMS[AXIS_FINAL],
+    label = "Chapter-1 cohort (3 axes)")
+} else {
+  data_full <- NULL
+  warning("FULL_DATA_PATH / FULL_DECISIONS_PATH not found. ",
+          "K selection and the final model will fall back to the ",
+          "CRP/WBC-inclusive cohort.")
+  K_SELECTION_COHORT <- "spec"
+  FINAL_COHORT       <- "spec"
+}
+
+pick_cohort <- function(which) if (identical(which, "spec") || is.null(data_full)) data_spec else data_full
+```
+
+## 2.4 Cohort reconciliation
+
+The two imputed files do not describe the same patients: requiring CRP and
+WBC to satisfy the sparsity criterion removes patients that the Chapter-1
+cohort retains. This is reported explicitly, because it determines what the
+response-set comparison of Section 3A can and cannot claim about the cohort
+of the final model.
+
+```{r cohort-reconciliation}
+if (!is.null(data_full)) {
+  in_both <- intersect(data_spec$patient_ids, data_full$patient_ids)
+  cohort_tbl <- tibble::tibble(
+    quantity = c("patients, Chapter-1 cohort",
+                 "patients, CRP/WBC-inclusive cohort",
+                 "patients in both",
+                 "in CRP/WBC cohort only",
+                 "in Chapter-1 cohort only",
+                 "CRP/WBC cohort as % of Chapter-1 cohort",
+                 "patient-days, Chapter-1 cohort",
+                 "patient-days, CRP/WBC cohort"),
+    value = c(data_full$n_patients,
+              data_spec$n_patients,
+              length(in_both),
+              length(setdiff(data_spec$patient_ids, data_full$patient_ids)),
+              length(setdiff(data_full$patient_ids, data_spec$patient_ids)),
+              round(100 * data_spec$n_patients / data_full$n_patients, 1),
+              data_full$n_rows,
+              data_spec$n_rows)
+  )
+  save_tab(cohort_tbl, "tab00_cohort_reconciliation",
+           caption = "Reconciliation of the two imputed cohorts.")
+
+  is_nested <- length(setdiff(data_spec$patient_ids, data_full$patient_ids)) == 0
+  cat("\nCRP/WBC cohort is a strict subset of the Chapter-1 cohort: ",
+      is_nested, "\n", sep = "")
+  if (!is_nested)
+    cat("NOTE: the CRP/WBC cohort contains patients absent from the ",
+        "Chapter-1 cohort. It is then not a nested subcohort and the ",
+        "thesis wording in Section 3.3 must say so.\n", sep = "")
+}
+```
+
+## 2.5 Empirical correlation between the four axes
+
+```{r corr-heatmap-4axes, fig.height=4.5}
+corr_vars <- unname(data_spec$RESPONSE_VARS_SAFE)
+corr_disp <- unname(data_spec$RESPONSE_VARS)
+
+corr_in <- data_spec$df |>
+  dplyr::select(dplyr::all_of(corr_vars)) |>
+  cor(use = "pairwise.complete.obs", method = "pearson")
+dimnames(corr_in) <- list(corr_disp, corr_disp)
+
+corr_long <- as.data.frame(corr_in) |>
+  tibble::rownames_to_column("var_i") |>
+  tidyr::pivot_longer(-var_i, names_to = "var_j", values_to = "rho") |>
+  dplyr::mutate(var_i = factor(var_i, levels = corr_disp),
+                var_j = factor(var_j, levels = rev(corr_disp)))
+
+p_corr <- ggplot(corr_long, aes(var_i, var_j, fill = rho)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", rho)), size = 4) +
+  scale_fill_gradient2(low = "#d73027", mid = "white", high = "#1a6faf",
+                       midpoint = 0, limits = c(-1, 1),
+                       name = "Pearson\ncorrelation") +
+  labs(title = "Empirical correlation between the four candidate axes",
+       subtitle = paste0("CRP/WBC-inclusive cohort, imputed data (pre-modelling); n = ",
+                         data_spec$n_patients, " patients"),
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_corr
+save_fig(p_corr, "fig01_correlation_four_axes", width = 7, height = 5.5)
+```
+
+---
+
+# 3. Model fitting engine
+
+One function fits one candidate model. Sections 3A and 3B call it; Section 5
+calls it once more for the final model. The construction is exactly the one
+used previously (stationary initial distribution, $k$-means starting values
+for the multivariate-normal emissions, diagonally dominant starting
+transition matrix, fixed seed), lifted out of the top-level chunks so that
+every candidate is fitted under identical conditions.
+
+```{r fit-engine}
+# ---- data frame in hmmTMB shape, for a given response set -----------------
+make_hmm_data <- function(D, resp_safe) {
+  keep_cols <- c("ID", "time", unname(resp_safe), D$OBS_COVARIATES_SAFE)
+  hd <- D$df |>
+    dplyr::select(dplyr::all_of(keep_cols)) |>
+    dplyr::arrange(ID, time)
+  hd$z <- asplit(as.matrix(hd[, unname(resp_safe), drop = FALSE]), 1)
+  hd
+}
+
+# ---- k-means starting values for the MVN emissions ------------------------
+kmeans_init <- function(hd, resp_safe, K, seed = SEED, verbose = FALSE,
+                        jitter_sd = 0) {
+  n_vars <- length(resp_safe)
+  set.seed(seed)
+  km_data <- as.matrix(hd[, unname(resp_safe), drop = FALSE])
+  km_data <- km_data[complete.cases(km_data), , drop = FALSE]
+  km <- kmeans(km_data, centers = K, nstart = 25)
+
+  # Order centres by the first response so re-runs are reproducible.
+  ord     <- order(km$centers[, 1])
+  centers <- km$centers[ord, , drop = FALSE]
+
+  cluster_assign <- km$cluster
+  sds        <- matrix(NA_real_, nrow = K, ncol = n_vars)
+  corrs_list <- vector("list", K)
+  for (k in seq_len(K)) {
+    idx <- which(cluster_assign == ord[k])
+    if (length(idx) >= 2) {
+      sub <- km_data[idx, , drop = FALSE]
+      sds[k, ] <- apply(sub, 2, sd)
+      corrs_list[[k]] <- cov2cor(cov(sub))
+    } else {
+      sds[k, ] <- apply(km_data, 2, sd)
+      corrs_list[[k]] <- diag(n_vars)
+    }
+  }
+  global_sd <- apply(km_data, 2, sd)
+  for (k in seq_len(K)) {
+    bad <- is.na(sds[k, ]) | sds[k, ] <= 0
+    sds[k, bad] <- global_sd[bad]
+  }
+
+  # Genuine perturbation of the starting point. Varying only the seed passed
+  # to kmeans() does NOT perturb anything: with nstart = 25 the partition is
+  # the same every time, so every "restart" would begin from identical values.
+  if (jitter_sd > 0) {
+    centers <- centers +
+      matrix(rnorm(K * n_vars, 0, jitter_sd) * rep(global_sd, each = K),
+             K, n_vars)
+    sds <- sds * exp(matrix(rnorm(K * n_vars, 0, jitter_sd / 2), K, n_vars))
+    centers <- centers[order(centers[, 1]), , drop = FALSE]
+  }
+
+  par0_z <- list()
+  for (i in seq_len(n_vars)) par0_z[[paste0("mu", i)]] <- centers[, i]
+  for (i in seq_len(n_vars)) par0_z[[paste0("sd", i)]] <- sds[, i]
+  if (n_vars >= 2) {
+    prs <- which(upper.tri(matrix(0, n_vars, n_vars)), arr.ind = TRUE)
+    for (k in seq_len(nrow(prs))) {
+      i <- prs[k, 1]; j <- prs[k, 2]
+      par0_z[[paste0("corr", i, j)]] <- sapply(corrs_list, function(R) R[i, j])
+    }
+  }
+  if (verbose) {
+    cat("Initial means from k-means (rows = responses, cols = raw states):\n")
+    mu_df <- as.data.frame(t(centers))
+    rownames(mu_df) <- unname(resp_safe)
+    colnames(mu_df) <- paste0("raw state ", seq_len(K))
+    print(round(mu_df, 3))
+  }
+  list(z = par0_z)
+}
+
+# ---- fit one candidate ----------------------------------------------------
+fit_hmm <- function(D, resp_safe, K, seed = SEED, tag = NULL, verbose = TRUE,
+                    jitter_sd = 0) {
+  stopifnot(IS_a_MVN)
+  tag <- tag %||% paste0(length(resp_safe), "resp_K", K)
+  hd  <- make_hmm_data(D, resp_safe)
+
+  hid  <- MarkovChain$new(data = hd, n_states = K, initial_state = "stationary")
+  par0 <- kmeans_init(hd, resp_safe, K, seed = seed, verbose = verbose,
+                      jitter_sd = jitter_sd)
+  obs  <- Observation$new(data = hd, dists = list(z = "mvnorm"),
+                          n_states = K, par = par0)
+  m    <- HMM$new(obs = obs, hid = hid)
+
+  t0 <- Sys.time()
+  set.seed(seed)
+  m$fit(silent = TRUE)
+  secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+  out <- m$out()
+  if (verbose) {
+    cat("\n[fit ", tag, "] convergence=", out$convergence,
+        " | ", out$message,
+        " | nll=", round(out$objective, 2),
+        " | iters=", out$iterations,
+        " | ", round(secs, 1), "s\n", sep = "")
+  }
+  if (!identical(out$convergence, 0L) && !identical(out$convergence, 0))
+    warning("Candidate ", tag, " did not report clean convergence.")
+
+  list(tag = tag, hmm = m, data = hd, K = K,
+       resp_safe = unname(resp_safe),
+       resp_disp = unname(D$safe_to_display[unname(resp_safe)]),
+       cohort = D$label, seconds = secs, out = out)
+}
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+```
+
+## 3.1 Diagnostics shared by all candidates
+
+`candidate_state_pars()` duplicates, deliberately, the parameter-extraction
+logic that Section 9.1 uses internally: the pseudo-residual implementation is
+left untouched, so the model-comparison code carries its own copy rather than
+reaching into it.
+
+```{r candidate-diagnostics}
+# ---- state parameters of a fitted candidate (raw state order) -------------
+candidate_state_pars <- function(fit) {
+  m <- fit$hmm; K <- fit$K; p <- length(fit$resp_safe)
+  op <- m$par()$obspar[, , 1]
+  mu <- sd <- matrix(NA_real_, K, p)
+  for (i in seq_len(p)) {
+    mu[, i] <- op[paste0("z.mu", i), ]
+    sd[, i] <- op[paste0("z.sd", i), ]
+  }
+  Sigma_list <- vector("list", K)
+  for (s in seq_len(K)) {
+    R <- diag(p)
+    if (p >= 2) {
+      idx <- which(upper.tri(R), arr.ind = TRUE)
+      for (k in seq_len(nrow(idx))) {
+        i <- idx[k, 1]; j <- idx[k, 2]
+        rho <- op[paste0("z.corr", i, j), s]
+        R[i, j] <- R[j, i] <- rho
+      }
+    }
+    Dm <- diag(sd[s, ], nrow = p)
+    Sigma_list[[s]] <- Dm %*% R %*% Dm
+  }
+  colnames(mu) <- colnames(sd) <- fit$resp_disp
+  list(mu = mu, sd = sd, Sigma = Sigma_list)
+}
+
+# ---- stationary distribution of a transition matrix -----------------------
+stationary_dist <- function(tpm) {
+  K <- nrow(tpm)
+  A <- rbind(t(tpm - diag(K)), rep(1, K))
+  b <- c(rep(0, K), 1)
+  as.numeric(solve(t(A) %*% A, t(A) %*% b))
+}
+
+# ---- log-likelihood / parameter count / information criteria --------------
+fit_loglik <- function(fit) {
+  ll <- try(as.numeric(stats::logLik(fit$hmm)), silent = TRUE)
+  if (inherits(ll, "try-error") || !is.finite(ll)) ll <- -fit$out$objective
+  ll
+}
+
+fit_npar <- function(fit) {
+  # Analytic count: K(K-1) transition parameters (rows sum to 1) + emission
+  # parameters (p means + p sds + p(p-1)/2 correlations per state). The
+  # initial distribution contributes NOTHING: it is constrained to the
+  # stationary distribution of Gamma.
+  K <- fit$K; p <- length(fit$resp_safe)
+  analytic <- K * (K - 1) + K * (2 * p + p * (p - 1) / 2)
+  from_aic <- (stats::AIC(fit$hmm) + 2 * fit_loglik(fit)) / 2
+  if (is.finite(from_aic) && abs(from_aic - analytic) > 0.5)
+    warning("Parameter count mismatch for ", fit$tag, ": analytic = ", analytic,
+            ", implied by AIC = ", round(from_aic, 1))
+  analytic
+}
+
+# Complete-data log-likelihood at the Viterbi path -> ICL.
+fit_icl <- function(fit) {
+  tryCatch({
+    m <- fit$hmm; hd <- fit$data; K <- fit$K
+    sp <- candidate_state_pars(fit)
+    tpm   <- m$par()$tpm[, , 1]
+    delta <- stationary_dist(tpm)
+    vit   <- m$viterbi()
+    X     <- as.matrix(hd[, fit$resp_safe, drop = FALSE])
+    idlist <- split(seq_len(nrow(hd)), hd$ID)
+
+    ll_c <- 0
+    for (rows in idlist) {
+      s <- vit[rows]
+      ll_c <- ll_c + log(delta[s[1]])
+      if (length(s) > 1)
+        ll_c <- ll_c + sum(log(tpm[cbind(s[-length(s)], s[-1])]))
+      for (k in unique(s)) {
+        sel <- which(s == k)
+        ll_c <- ll_c + sum(mvtnorm::dmvnorm(X[rows[sel], , drop = FALSE],
+                                            mean = sp$mu[k, ],
+                                            sigma = sp$Sigma[[k]], log = TRUE))
+      }
+    }
+    -2 * ll_c + fit_npar(fit) * log(nrow(hd))
+  }, error = function(e) { warning("ICL failed for ", fit$tag, ": ",
+                                   conditionMessage(e)); NA_real_ })
+}
+
+fit_metrics <- function(fit) {
+  ll <- fit_loglik(fit); np <- fit_npar(fit); n <- nrow(fit$data)
+  tibble::tibble(
+    model     = fit$tag,
+    cohort    = fit$cohort,
+    responses = paste(fit$resp_disp, collapse = " + "),
+    p         = length(fit$resp_safe),
+    K         = fit$K,
+    n_obs     = n,
+    n_patients = dplyr::n_distinct(fit$data$ID),
+    logLik    = ll,
+    npar      = np,
+    AIC       = -2 * ll + 2 * np,
+    BIC       = -2 * ll + np * log(n),
+    ICL       = fit_icl(fit),
+    seconds   = fit$seconds
+  )
+}
+
+# ---- overlap between state-dependent marginals ----------------------------
+# Overlapping coefficient of two univariate normals: the integral of the
+# pointwise minimum of the two densities. 1 = identical, 0 = disjoint.
+# A response variable whose states all overlap contributes parameters
+# without contributing separation, which is exactly the STAGE 1 question.
+ovl_normal <- function(m1, s1, m2, s2) {
+  lo <- min(m1 - 8 * s1, m2 - 8 * s2)
+  hi <- max(m1 + 8 * s1, m2 + 8 * s2)
+  f  <- function(x) pmin(dnorm(x, m1, s1), dnorm(x, m2, s2))
+  stats::integrate(f, lo, hi, subdivisions = 2000L, rel.tol = 1e-8)$value
+}
+
+overlap_table <- function(fit) {
+  sp <- candidate_state_pars(fit); K <- fit$K
+  prs <- t(combn(K, 2))
+  purrr::map_dfr(seq_along(fit$resp_disp), function(i) {
+    v <- purrr::map_dbl(seq_len(nrow(prs)), function(r) {
+      a <- prs[r, 1]; b <- prs[r, 2]
+      ovl_normal(sp$mu[a, i], sp$sd[a, i], sp$mu[b, i], sp$sd[b, i])
+    })
+    sep <- purrr::map_dbl(seq_len(nrow(prs)), function(r) {
+      a <- prs[r, 1]; b <- prs[r, 2]
+      abs(sp$mu[a, i] - sp$mu[b, i]) / sqrt((sp$sd[a, i]^2 + sp$sd[b, i]^2) / 2)
+    })
+    tibble::tibble(
+      model         = fit$tag,
+      biomarker     = fit$resp_disp[i],
+      mean_overlap  = mean(v),
+      min_overlap   = min(v),
+      max_overlap   = max(v),
+      mean_separation = mean(sep),
+      max_separation  = max(sep)
+    )
+  })
+}
+
+overlap_pairs <- function(fit) {
+  sp <- candidate_state_pars(fit); K <- fit$K
+  prs <- t(combn(K, 2))
+  purrr::map_dfr(seq_along(fit$resp_disp), function(i)
+    purrr::map_dfr(seq_len(nrow(prs)), function(r) {
+      a <- prs[r, 1]; b <- prs[r, 2]
+      tibble::tibble(biomarker = fit$resp_disp[i],
+                     state_a = paste0("S", a), state_b = paste0("S", b),
+                     ovl = ovl_normal(sp$mu[a, i], sp$sd[a, i],
+                                      sp$mu[b, i], sp$sd[b, i]))
+    }))
+}
+
+# ---- state-dependent densities on the model (z-score) scale ---------------
+# Candidate models are shown with RAW state indices: they have no clinical
+# labels, and attaching any would presuppose the interpretation that only
+# the final model earns.
+plot_state_densities <- function(fit, title = NULL, subtitle = NULL) {
+  sp  <- candidate_state_pars(fit)
+  vit <- fit$hmm$viterbi()
+  w   <- as.numeric(prop.table(table(factor(vit, levels = seq_len(fit$K)))))
+  X   <- as.matrix(fit$data[, fit$resp_safe, drop = FALSE])
+
+  dens <- purrr::map_dfr(seq_along(fit$resp_disp), function(i) {
+    rng  <- range(X[, i], na.rm = TRUE)
+    grid <- seq(rng[1] - 0.1 * diff(rng), rng[2] + 0.1 * diff(rng),
+                length.out = 400)
+    purrr::map_dfr(seq_len(fit$K), function(s)
+      tibble::tibble(biomarker = fit$resp_disp[i],
+                     state = paste0("State ", s),
+                     x = grid,
+                     density = w[s] * dnorm(grid, sp$mu[s, i], sp$sd[s, i])))
+  })
+  total <- dens |>
+    dplyr::group_by(biomarker, x) |>
+    dplyr::summarise(density = sum(density), .groups = "drop")
+
+  obs_long <- tibble::as_tibble(X) |>
+    setNames(fit$resp_disp) |>
+    tidyr::pivot_longer(dplyr::everything(),
+                        names_to = "biomarker", values_to = "value")
+
+  ggplot() +
+    geom_histogram(data = obs_long, aes(value, after_stat(density)),
+                   bins = 60, fill = "grey85", colour = NA) +
+    geom_line(data = dens, aes(x, density, colour = state), linewidth = 0.7) +
+    geom_line(data = total, aes(x, density), linetype = "dashed",
+              colour = "grey30", linewidth = 0.5) +
+    facet_wrap(~ biomarker, scales = "free", ncol = 2) +
+    scale_colour_brewer(palette = "Dark2", name = "Raw state") +
+    labs(title = title %||% paste0("State-dependent distributions — ", fit$tag),
+         subtitle = subtitle %||%
+           "Model scale (z-scored, log1p where flagged). Solid: state density x Pr(state). Dashed: mixture.",
+         x = NULL, y = "Density") +
+    theme(legend.position = "bottom")
+}
+
+# ---- occupancy summary (raw states) ---------------------------------------
+occupancy_summary <- function(fit) {
+  vit <- fit$hmm$viterbi()
+  d   <- tibble::tibble(ID = fit$data$ID, state = vit)
+  per <- d |>
+    dplyr::group_by(ID) |>
+    dplyr::summarise(n_states = dplyr::n_distinct(state), .groups = "drop")
+  tibble::tibble(
+    model = fit$tag,
+    K = fit$K,
+    stayers  = sum(per$n_states == 1),
+    switchers = sum(per$n_states > 1),
+    pct_stayers = round(100 * mean(per$n_states == 1), 1),
+    smallest_state_pct =
+      round(100 * min(prop.table(table(factor(vit, levels = seq_len(fit$K))))), 1),
+    mean_diag_tpm = round(mean(diag(fit$hmm$par()$tpm[, , 1])), 4)
+  )
+}
+```
+
+---
+
+# 3A. STAGE 1 — Response set: does the inflammatory axis separate states?
+
+The response set is fixed **before** the number of states. The order matters:
+$K$ answers "how many regimes does this observation vector resolve", and that
+question is only well posed once the observation vector is fixed. Both models
+below are fitted at the same $K =$ `r K_AXIS_TEST` on the same cohort, so the
+comparison isolates the effect of the response set.
+
+Hypothesis under test: the inflammatory axis (`r AXIS_STEMS[[AXIS_UNDER_TEST]]`)
+does not separate the latent states, i.e. its state-dependent marginals
+overlap across all state pairs, so it consumes emission parameters without
+contributing to the partition.
+
+```{r stage1-config}
+# Decision rule, fixed before looking at the fits: drop the axis whose mean
+# pairwise overlapping coefficient is the largest AND exceeds this threshold.
+OVL_DROP_THRESHOLD <- 0.75
+```
+
+## 3A.1 Fit: four axes at K = `r K_AXIS_TEST`
+
+```{r stage1-fit-4axis, cache=TRUE}
+fit_4axis <- fit_hmm(data_spec,
+                     data_spec$RESPONSE_VARS_SAFE,
+                     K = K_AXIS_TEST,
+                     tag = "4axes_K4")
+```
+
+## 3A.2 Fit: three axes at K = `r K_AXIS_TEST`, same cohort
+
+```{r stage1-fit-3axis, cache=TRUE}
+fit_3axis_spec <- fit_hmm(data_spec,
+                          data_spec$RESPONSE_VARS_SAFE[AXIS_FINAL],
+                          K = K_AXIS_TEST,
+                          tag = "3axes_K4")
+```
+
+## 3A.3 State-dependent distributions
+
+```{r stage1-densities, fig.height=7}
+p_dens4 <- plot_state_densities(
+  fit_4axis,
+  title = paste0("Four clinical axes, K = ", K_AXIS_TEST,
+                 " — state-dependent distributions"),
+  subtitle = paste0("Cohort: ", data_spec$label,
+                    "; model scale. Raw state indices (no clinical labels)."))
+p_dens4
+save_fig(p_dens4, "fig02_stage1_densities_four_axes", width = 10, height = 7)
+
+p_dens3 <- plot_state_densities(
+  fit_3axis_spec,
+  title = paste0("Three clinical axes, K = ", K_AXIS_TEST,
+                 " — state-dependent distributions"),
+  subtitle = paste0("Cohort: ", data_spec$label, "; model scale."))
+p_dens3
+save_fig(p_dens3, "fig03_stage1_densities_three_axes", width = 10, height = 5.5)
+```
+
+## 3A.4 Overlap and separation of the state-dependent marginals
+
+```{r stage1-overlap, fig.height=4.5}
+ovl_tbl <- overlap_table(fit_4axis) |>
+  dplyr::arrange(dplyr::desc(mean_overlap))
+save_tab(ovl_tbl, "tab01_stage1_overlap_by_axis",
+         caption = paste0("Four-axis model (K = ", K_AXIS_TEST,
+                          "): pairwise overlapping coefficient and standardised ",
+                          "separation of the state-dependent marginals, by axis. ",
+                          "Overlap 1 = the states are indistinguishable along ",
+                          "that axis."))
+
+ovl_pairs <- overlap_pairs(fit_4axis) |>
+  dplyr::mutate(pair = paste(state_a, state_b, sep = " vs "))
+
+p_ovl <- ggplot(ovl_pairs, aes(pair, biomarker, fill = ovl)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", ovl)), size = 3.4) +
+  scale_fill_gradient(low = "white", high = "#C5000BFF", limits = c(0, 1),
+                      name = "Overlapping\ncoefficient") +
+  labs(title = paste0("Pairwise overlap of state-dependent marginals (K = ",
+                      K_AXIS_TEST, ", four axes)"),
+       subtitle = "Red = the two states are indistinguishable along that axis",
+       x = "State pair", y = NULL) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+p_ovl
+save_fig(p_ovl, "fig04_stage1_overlap_heatmap", width = 9, height = 4.5)
+
+p_ovl_bar <- ggplot(ovl_tbl, aes(reorder(biomarker, mean_overlap), mean_overlap)) +
+  geom_col(fill = "#004586FF", width = 0.6) +
+  geom_hline(yintercept = OVL_DROP_THRESHOLD, linetype = "dashed",
+             colour = "red") +
+  geom_text(aes(label = sprintf("%.2f", mean_overlap)), hjust = -0.15, size = 3.5) +
+  coord_flip(ylim = c(0, 1)) +
+  labs(title = "Mean pairwise overlap of the state-dependent marginals, by axis",
+       subtitle = paste0("Dashed line: pre-specified drop threshold = ",
+                         OVL_DROP_THRESHOLD),
+       x = NULL, y = "Mean overlapping coefficient")
+p_ovl_bar
+save_fig(p_ovl_bar, "fig05_stage1_mean_overlap_by_axis", width = 8, height = 4)
+```
+
+## 3A.5 Cost of the fourth axis
+
+```{r stage1-comparison}
+stage1_tbl <- dplyr::bind_rows(fit_metrics(fit_4axis),
+                               fit_metrics(fit_3axis_spec))
+save_tab(stage1_tbl, "tab02_stage1_model_comparison",
+         caption = paste0("Response-set comparison at K = ", K_AXIS_TEST,
+                          " on the ", data_spec$label, " cohort. ",
+                          "AIC/BIC/ICL are NOT comparable across response sets ",
+                          "(different data), and are reported only to document ",
+                          "the parameter cost of the fourth axis."))
+cat("\nNOTE: the two rows above are fitted to different observation vectors,",
+    "\nso their likelihoods are not on a common scale. The comparison that",
+    "\ncarries the argument is the overlap table, not the criteria.\n")
+```
+
+## 3A.6 Verdict
+
+```{r stage1-verdict}
+worst <- ovl_tbl$biomarker[1]
+worst_ovl <- ovl_tbl$mean_overlap[1]
+target <- unname(data_spec$RESPONSE_VARS[[AXIS_UNDER_TEST]])
+
+cat("Axis with the largest mean overlap : ", worst,
+    " (", round(worst_ovl, 3), ")\n", sep = "")
+cat("Axis under test (", AXIS_UNDER_TEST, ")        : ", target, "\n", sep = "")
+
+reproduced <- identical(worst, target) && worst_ovl > OVL_DROP_THRESHOLD
+if (reproduced) {
+  cat("\nDECISION RULE SATISFIED: the inflammatory axis both has the largest\n",
+      "mean pairwise overlap and exceeds the pre-specified threshold of ",
+      OVL_DROP_THRESHOLD, ". It is dropped from the response set.\n", sep = "")
+} else {
+  cat("\n*** DECISION RULE NOT SATISFIED ***\n",
+      "The pre-specified rule does not select the inflammatory axis on this\n",
+      "run. Do not write the chapter claim as it stands: either the threshold\n",
+      "or the argument has to change. The response set below still follows\n",
+      "AXIS_FINAL, so the rest of the notebook is runnable, but this result\n",
+      "must be reconciled before drafting Section 3.3 of the thesis.\n", sep = "")
+}
+
+RESPONSE_AXES_FINAL <- AXIS_FINAL
+cat("\nResponse set fixed for everything downstream: ",
+    paste(unname(data_spec$RESPONSE_VARS[RESPONSE_AXES_FINAL]), collapse = ", "),
+    "\n", sep = "")
+```
+
+```{r stage1-cleanup}
+# Requirement: discarded candidates are not carried forward. Only the
+# summary tables survive Stage 1.
+stage1_metrics <- stage1_tbl
+stage1_overlap <- ovl_tbl
+rm(fit_4axis, fit_3axis_spec, p_dens4, p_dens3)
+invisible(gc())
+```
+
+---
+
+# 3B. STAGE 2 — Number of latent states
+
+With the response set fixed, $K$ is selected by fitting the candidate models
+and weighing the evidence, following the pragmatic protocol of Chapter 2:
+fit every candidate in an a-priori plausible range, inspect the fitted
+state-dependent distributions, check the decoded occupancy, and read the
+information criteria as one input among several rather than as a decision
+rule. The range is restricted to `r paste(K_GRID, collapse = ", ")`: below 3
+the model cannot represent three clinical axes, and above 5 the fits are
+expensive and, in this application, uninterpretable.
+
+```{r stage2-config}
+# Set to 3, 4 or 5 to record the final decision explicitly. When NULL, the
+# notebook falls back to the BIC-minimising candidate among those that pass
+# the interpretability guard below, and says so.
+K_FINAL_OVERRIDE <- 4
+
+# Interpretability guard: every state must be occupied by at least this
+# share of patient-days in the Viterbi decoding.
+MIN_STATE_SHARE_PCT <- 5
+```
+
+```{r stage2-cohort}
+data_K <- pick_cohort(K_SELECTION_COHORT)
+resp_K <- data_K$RESPONSE_VARS_SAFE[intersect(RESPONSE_AXES_FINAL,
+                                              names(data_K$RESPONSE_VARS_SAFE))]
+cat("K selection on cohort: ", data_K$label,
+    " (", data_K$n_patients, " patients, ", data_K$n_rows, " patient-days)\n",
+    sep = "")
+cat("Response set        : ",
+    paste(unname(data_K$safe_to_display[unname(resp_K)]), collapse = ", "),
+    "\n", sep = "")
+```
+
+## 3B.1 Fits
+
+```{r stage2-fits, cache=TRUE}
+fits_K <- lapply(K_GRID, function(k)
+  fit_hmm(data_K, resp_K, K = k, tag = paste0("3axes_K", k), verbose = TRUE))
+names(fits_K) <- paste0("K", K_GRID)
+```
+
+## 3B.2 Information criteria
+
+```{r stage2-criteria, fig.height=4.5}
+crit_tbl <- purrr::map_dfr(fits_K, fit_metrics)
+save_tab(crit_tbl, "tab03_stage2_information_criteria",
+         caption = paste0("Candidate models on the fixed response set, cohort: ",
+                          data_K$label,
+                          ". npar excludes the initial distribution, which is ",
+                          "constrained to the stationary distribution of Gamma."))
+
+crit_long <- crit_tbl |>
+  dplyr::select(K, AIC, BIC, ICL) |>
+  tidyr::pivot_longer(-K, names_to = "criterion", values_to = "value") |>
+  dplyr::filter(is.finite(value))
+
+p_crit <- ggplot(crit_long, aes(factor(K), value, group = criterion,
+                                colour = criterion)) +
+  geom_line(linewidth = 0.7) + geom_point(size = 2.5) +
+  facet_wrap(~ criterion, scales = "free_y") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(title = "Information criteria against the number of states",
+       subtitle = paste0("Cohort: ", data_K$label,
+                         "; smaller is better. Criteria are guidance, not a ",
+                         "decision rule (Chapter 2)."),
+       x = "Number of latent states K", y = NULL)
+p_crit
+save_fig(p_crit, "fig06_stage2_information_criteria", width = 10, height = 4)
+```
+
+## 3B.3 Fitted state-dependent distributions per K
+
+```{r stage2-densities, fig.height=12}
+dens_panels <- lapply(names(fits_K), function(nm)
+  plot_state_densities(fits_K[[nm]],
+                       title = paste0("K = ", fits_K[[nm]]$K),
+                       subtitle = NULL) +
+    theme(legend.position = "right"))
+p_dens_K <- patchwork::wrap_plots(dens_panels, ncol = 1) +
+  patchwork::plot_annotation(
+    title = "State-dependent distributions across candidate state counts",
+    subtitle = paste0("Fixed response set; cohort: ", data_K$label,
+                      "; model scale; raw state indices."))
+p_dens_K
+save_fig(p_dens_K, "fig07_stage2_densities_by_K", width = 10, height = 12)
+```
+
+## 3B.4 Separation and occupancy per K
+
+```{r stage2-separation, fig.height=4.5}
+sep_tbl <- purrr::map_dfr(fits_K, overlap_table)
+save_tab(sep_tbl, "tab04_stage2_overlap_by_K",
+         caption = "Overlap and separation of the state-dependent marginals, by candidate K.")
+
+occ_tbl <- purrr::map_dfr(fits_K, occupancy_summary)
+save_tab(occ_tbl, "tab05_stage2_occupancy_by_K",
+         caption = paste0("Decoded occupancy by candidate K. `smallest_state_pct` ",
+                          "is the share of patient-days assigned to the least ",
+                          "occupied state; states below ", MIN_STATE_SHARE_PCT,
+                          "% are treated as not interpretable."))
+
+p_sep <- ggplot(sep_tbl, aes(factor(model), mean_overlap, fill = biomarker)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  scale_fill_brewer(palette = "Dark2", name = NULL) +
+  labs(title = "Mean pairwise overlap of state-dependent marginals, by K",
+       subtitle = "Lower is better: the states are more clearly separated along that axis",
+       x = NULL, y = "Mean overlapping coefficient") +
+  theme(legend.position = "bottom")
+p_sep
+save_fig(p_sep, "fig08_stage2_overlap_by_K", width = 9, height = 4.5)
+```
+
+## 3B.5 Selection
+
+```{r stage2-verdict}
+guard <- occ_tbl |>
+  dplyr::mutate(passes = smallest_state_pct >= MIN_STATE_SHARE_PCT) |>
+  dplyr::select(model, K, smallest_state_pct, passes)
+print(guard)
+
+eligible <- guard$K[guard$passes]
+bic_pick <- crit_tbl$K[which.min(crit_tbl$BIC)]
+bic_pick_eligible <- if (length(eligible) > 0) {
+  crit_tbl$K[crit_tbl$K %in% eligible][which.min(crit_tbl$BIC[crit_tbl$K %in% eligible])]
+} else {
+  NA_integer_
+}
+
+cat("\nBIC-minimising K (all candidates)          : ", bic_pick, "\n", sep = "")
+cat("BIC-minimising K (passing occupancy guard) : ", bic_pick_eligible, "\n", sep = "")
+
+if (!is.null(K_FINAL_OVERRIDE)) {
+  K_FINAL <- K_FINAL_OVERRIDE
+  cat("\nK fixed by explicit decision: K = ", K_FINAL, ".\n", sep = "")
+  if (!identical(as.integer(K_FINAL), as.integer(bic_pick)))
+    cat("This differs from the BIC-minimising candidate (K = ", bic_pick,
+        "). The thesis must state the reason (interpretability of the ",
+        "additional state), per Remark 'Status of the selected order' in ",
+        "Chapter 2.\n", sep = "")
+} else {
+  K_FINAL <- bic_pick_eligible
+  cat("\nNo explicit decision recorded; falling back to the BIC-minimising ",
+      "candidate that passes the occupancy guard: K = ", K_FINAL, ".\n", sep = "")
+}
+stopifnot(K_FINAL %in% K_GRID)
+```
+
+```{r stage2-cleanup}
+# Requirement: no discarded candidate survives this point.
+stage2_criteria  <- crit_tbl
+stage2_overlap   <- sep_tbl
+stage2_occupancy <- occ_tbl
+rm(fits_K, dens_panels, p_dens_K)
+invisible(gc())
+cat("Candidate models discarded. From here on the notebook uses one model:\n")
+cat("  response set : ",
+    paste(unname(data_spec$RESPONSE_VARS[RESPONSE_AXES_FINAL]), collapse = ", "),
+    "\n  K            : ", K_FINAL,
+    "\n  cohort       : ", pick_cohort(FINAL_COHORT)$label, "\n", sep = "")
+```
+
+---
+
+# 4. Final model specification
+
+Everything below applies to a single model: the response set fixed in
+Section 3A and the state count fixed in Section 3B, refitted from scratch on
+the cohort selected by `FINAL_COHORT`. No candidate from the two selection
+stages is reused.
+
+```{r final-promote}
+data_final <- pick_cohort(FINAL_COHORT)
+
+resp_final_axes <- intersect(RESPONSE_AXES_FINAL,
+                             names(data_final$RESPONSE_VARS_SAFE))
+resp_final_safe <- unname(data_final$RESPONSE_VARS_SAFE[resp_final_axes])
+
+# Promote this cohort's data frame and back-transform helpers to the global
+# names that Sections 6-12 (unchanged from the previous notebook) read.
+use_dataset(data_final, resp_final_safe)
+
+N_STATES <- as.integer(K_FINAL)
+DATA_PATH               <- data_final$data_path
+BM_LOG1P_DECISIONS_PATH <- if (identical(FINAL_COHORT, "spec"))
+  SPEC_DECISIONS_PATH else FULL_DECISIONS_PATH
+
+cat("Final model\n")
+cat("  cohort        : ", data_final$label, " (", data_final$n_patients,
+    " patients, ", data_final$n_rows, " patient-days)\n", sep = "")
+cat("  response set  : ", paste(RESPONSE_VARS, collapse = ", "), "\n", sep = "")
+cat("  latent states : ", N_STATES, "\n", sep = "")
+cat("  covariates    : ", if (has_covariates)
+      paste(OBS_COVARIATES, collapse = ", ") else "none", "\n", sep = "")
+cat("  hold-out      : none (TEST_FRAC = 0)\n")
+```
+
+## 4.1 Parameter count rationale
+
+```{r param-count-rationale, echo=FALSE}
+p      <- length(RESPONSE_VARS)
+n_cov  <- p * (p - 1) / 2
+p_all  <- length(bio_cols)
+n_cov_all <- p_all * (p_all - 1) / 2
+n_extra_per_state <- length(OBS_COVARIATES)
+
+indep_sel  <- p * 2 * N_STATES
+mvn_sel    <- (p + p + n_cov) * N_STATES
+indep_all  <- p_all * 2 * N_STATES
+mvn_all    <- (p_all + p_all + n_cov_all) * N_STATES
+extra_obs  <- if (has_covariates) p * N_STATES * n_extra_per_state else 0
+
+param_tbl <- data.frame(
+  Model = c(
+    paste0(p, " independent normals — selected biomarkers",
+           if (!IS_a_MVN) " **(this model)**" else ""),
+    paste0(p, "-dim full MVN — selected biomarkers",
+           if (IS_a_MVN) " **(this model)**" else ""),
+    paste0(p_all, " independent normals — all available biomarkers"),
+    paste0(p_all, "-dim full MVN — all available biomarkers")
+  ),
+  Formula = c(
+    paste0(p, " vars × 2 params × ", N_STATES, " states"),
+    paste0("(", p, " means + ", p, " sds + ", n_cov, " corrs) × ", N_STATES, " states"),
+    paste0(p_all, " vars × 2 params × ", N_STATES, " states"),
+    paste0("(", p_all, " means + ", p_all, " sds + ", n_cov_all, " corrs) × ", N_STATES, " states")
+  ),
+  `Obs. parameters (no covariates)` = c(indep_sel, mvn_sel, indep_all, mvn_all),
+  check.names = FALSE
+)
+
+cap <- paste0("Observation parameter counts for ", N_STATES,
+              " states and ", p, " selected biomarkers (", p_all,
+              " total available).")
+if (has_covariates) {
+  cap <- paste0(cap, " The configured covariates (",
+                paste(OBS_COVARIATES, collapse = ", "),
+                ") add ", extra_obs,
+                " extra mean-effect coefficients to the selected model.")
+}
+knitr::kable(param_tbl, align = c("l", "l", "r"), caption = cap)
+```
+
+
+---
+
+# 5. Final model fitting
+
+The likelihood of a hidden Markov model is generally multimodal, and a single
+optimisation started from one $k$-means partition reaches a local maximum with
+no guarantee that it is the global one. The final model is therefore obtained
+by a best-of-$R$ multi-start procedure: the fit is repeated from $R$ perturbed
+starting points, and the solution attaining the highest maximised
+log-likelihood is retained. Every downstream section uses that solution.
+
+```{r final-fit, cache=TRUE}
+N_STARTS  <- 25     # perturbed starts, in addition to the unperturbed one
+JITTER_SD <- 0.5    # displacement of the k-means centres, in units of the
+                    # marginal sd; sds are scaled by a lognormal factor
+
+fit_one <- function(r) {
+  tryCatch(
+    fit_hmm(data_final, resp_final_safe, K = N_STATES,
+            seed = if (r == 0) SEED else SEED + 7919 * r,
+            jitter_sd = if (r == 0) 0 else JITTER_SD,
+            tag = if (r == 0) "start_0_kmeans" else paste0("start_", r),
+            verbose = FALSE),
+    error = function(e) { warning("start ", r, " failed: ",
+                                  conditionMessage(e)); NULL })
+}
+
+starts <- lapply(0:N_STARTS, fit_one)
+ok     <- !vapply(starts, is.null, logical(1))
+lls    <- vapply(starts, function(f) if (is.null(f)) NA_real_ else fit_loglik(f),
+                 numeric(1))
+
+best_i <- which.max(lls)
+final    <- starts[[best_i]]
+hmm      <- final$hmm
+hmm_data <- final$data
+
+start_tbl <- tibble::tibble(
+  start       = c("0 (k-means, unperturbed)", paste0(1:N_STARTS, " (perturbed)")),
+  logLik      = lls,
+  convergence = vapply(starts, function(f)
+                  if (is.null(f)) NA_integer_ else as.integer(f$out$convergence),
+                  integer(1)),
+  iterations  = vapply(starts, function(f)
+                  if (is.null(f)) NA_integer_ else as.integer(f$out$iterations),
+                  integer(1))) |>
+  dplyr::mutate(gap_to_best = round(max(logLik, na.rm = TRUE) - logLik, 4),
+                retained    = dplyr::row_number() == best_i)
+
+save_tab(start_tbl, "tab06_final_multistart", digits = 4,
+         caption = paste0("Maximised log-likelihood from ", N_STARTS + 1,
+                          " starting points (one k-means partition and ",
+                          N_STARTS, " perturbations of it). The retained model ",
+                          "is the row with gap_to_best = 0."))
+
+# Distinct local maxima actually visited, to the nearest 0.01 nats.
+modes <- as.data.frame(table(round(lls[ok], 2)), stringsAsFactors = FALSE) |>
+  setNames(c("logLik", "n_starts")) |>
+  dplyr::arrange(dplyr::desc(as.numeric(logLik)))
+save_tab(modes, "tab06b_final_local_maxima", digits = 4,
+         caption = paste0("Distinct local maxima visited by the ", sum(ok),
+                          " successful starts, and how many starts reached each."))
+
+cat("\n-- Retained model --\n")
+cat("start index          : ", best_i - 1, "\n", sep = "")
+cat("maximised logLik     : ", format(lls[best_i], digits = 12), "\n", sep = "")
+cat("starts reaching it   : ", sum(abs(lls - lls[best_i]) < 1e-3, na.rm = TRUE),
+    " of ", sum(ok), "\n", sep = "")
+cat("distinct local maxima: ", nrow(modes), "\n", sep = "")
+cat("gap to the k-means solution: ",
+    round(lls[best_i] - lls[1], 4), " log-likelihood units\n", sep = "")
+
+out <- hmm$out()
+cat("\nConvergence code:", out$convergence, "\n")
+cat("Message:", out$message, "\n")
+cat("Final negative log-likelihood:", format(out$objective, digits = 12), "\n")
+cat("Iterations used:", out$iterations, "\n")
+
+cat("\n-- Estimated parameters --\n")
+hmm
+```
+
+## 5.1 Starting values of the retained fit
+
+```{r final-startvals}
+cat("Default initial transition matrix (hmmTMB):\n")
+print(round(MarkovChain$new(data = hmm_data, n_states = N_STATES,
+                            initial_state = "stationary")$tpm()[, , 1], 4))
+
+cat("\nStandardisation constants of the estimation scale:\n")
+print(as.data.frame(zscore_params), row.names = FALSE)
+```
+
+## 5.2 Clinical state labels — final model only
+
+Raw state indices come from the $k$-means initialisation and carry no
+clinical meaning. Labels are assigned here, from the estimated state means
+in clinical units, and only to this model.
+
+The previous label set contained one state called *Weak*, which conflated
+two distinct profiles, and one called *Epatic*, an Italianism. Both are
+retired. The label set is now **Stable / Anaemic / Hepatic / Renal**, assigned
+by the following deterministic rule (K = 4):
+
+1. **Renal** — the state with the highest mean creatinine.
+2. **Hepatic** — among the remaining states, the highest mean ALT.
+3. **Anaemic** — among the remaining states, the lowest mean haemoglobin.
+4. **Stable** — the state left over.
+
+```{r final-state-labels}
+op_final <- hmm$par()$obspar[, , 1]                 # raw state order
+mu_model <- sapply(seq_along(resp_final_safe), function(i) op_final[paste0("z.mu", i), ])
+mu_model <- matrix(mu_model, nrow = N_STATES)
+colnames(mu_model) <- resp_final_safe
+
+mu_clin <- mu_model
+for (i in seq_along(resp_final_safe))
+  mu_clin[, i] <- to_clinical(mu_model[, i], resp_final_safe[i])
+colnames(mu_clin) <- display_vec(resp_final_safe)
+
+cat("Estimated state means in clinical units (RAW state order):\n")
+print(round(as.data.frame(mu_clin), 3))
+
+axis_col <- function(axis) {
+  sfe <- data_final$RESPONSE_VARS_SAFE[[axis]]
+  match(sfe, resp_final_safe)
+}
+
+if (!is.null(STATE_LABELS_MAP_OVERRIDE)) {
+  STATE_LABELS_MAP    <- STATE_LABELS_MAP_OVERRIDE
+  STATE_DISPLAY_ORDER <- STATE_LABEL_ORDER
+  cat("\nUsing the manual label override from Section 0.\n")
+
+} else if (N_STATES == 4L && all(c("renal", "hepatic", "haematological")
+                                 %in% resp_final_axes)) {
+  remaining <- seq_len(N_STATES)
+  i_renal   <- remaining[which.max(mu_clin[remaining, axis_col("renal")])]
+  remaining <- setdiff(remaining, i_renal)
+  i_hep     <- remaining[which.max(mu_clin[remaining, axis_col("hepatic")])]
+  remaining <- setdiff(remaining, i_hep)
+  i_anaem   <- remaining[which.min(mu_clin[remaining, axis_col("haematological")])]
+  i_stable  <- setdiff(remaining, i_anaem)
+
+  lab <- character(N_STATES)
+  lab[i_renal]  <- "Renal state"
+  lab[i_hep]    <- "Hepatic state"
+  lab[i_anaem]  <- "Anaemic state"
+  lab[i_stable] <- "Stable state"
+
+  STATE_LABELS_MAP    <- as.list(setNames(lab, as.character(seq_len(N_STATES))))
+  STATE_DISPLAY_ORDER <- STATE_LABEL_ORDER
+  cat("\nAutomatic clinical labelling (raw index -> label):\n")
+  print(unlist(STATE_LABELS_MAP))
+
+} else {
+  STATE_LABELS_MAP    <- NULL
+  STATE_DISPLAY_ORDER <- NULL
+  warning("Automatic labelling is defined for K = 4 with the renal/hepatic/",
+          "haematological axes present. K = ", N_STATES,
+          " -> falling back to raw state numbering. Set ",
+          "STATE_LABELS_MAP_OVERRIDE in Section 0 to label these states.")
+}
+```
+
+```{r final-state-remap}
+USE_CUSTOM_STATE_LABELS <-
+  !is.null(STATE_LABELS_MAP) && !is.null(STATE_DISPLAY_ORDER)
+
+if (USE_CUSTOM_STATE_LABELS) {
+  if (length(STATE_LABELS_MAP) != N_STATES)
+    stop("STATE_LABELS_MAP must have length ", N_STATES, ".")
+  if (!setequal(names(STATE_LABELS_MAP), as.character(seq_len(N_STATES))))
+    stop("STATE_LABELS_MAP names must be \"1\"..\"", N_STATES, "\".")
+  if (!setequal(STATE_DISPLAY_ORDER, unlist(STATE_LABELS_MAP)))
+    stop("STATE_DISPLAY_ORDER labels must match STATE_LABELS_MAP values.")
+
+  state_remap <- vapply(
+    seq_len(N_STATES),
+    function(i) match(STATE_LABELS_MAP[[as.character(i)]], STATE_DISPLAY_ORDER),
+    integer(1))
+  state_levels <- STATE_DISPLAY_ORDER
+
+  state_palette_vec <-
+    if (!is.null(STATE_PALETTE_CUSTOM) &&
+        length(STATE_PALETTE_CUSTOM) == N_STATES) STATE_PALETTE_CUSTOM
+    else unname(pal[seq_len(N_STATES)])
+} else {
+  state_remap       <- seq_len(N_STATES)
+  state_levels      <- paste0("State ", seq_len(N_STATES))
+  state_palette_vec <- unname(pal[seq_len(N_STATES)])
+}
+
+state_remap_inv <- order(state_remap)
+state_colours   <- setNames(state_palette_vec, state_levels)
+relabel_state_token <- function(raw_idx) state_levels[state_remap[raw_idx]]
+
+cat("State remap (raw -> new):\n"); print(setNames(state_remap, paste0("raw_", seq_len(N_STATES))))
+cat("\nState levels (display order):\n"); print(state_levels)
+```
+
+### Verification of the labelling
+
+```{r final-label-check}
+label_check <- as.data.frame(mu_clin)
+label_check$raw_state <- seq_len(N_STATES)
+label_check$label     <- state_levels[state_remap]
+label_check <- label_check |>
+  dplyr::relocate(raw_state, label) |>
+  dplyr::arrange(match(label, state_levels))
+save_tab(label_check, "tab07_final_state_labels",
+         caption = paste0("Final model: estimated state means in clinical units ",
+                          "and the label assigned to each state. Check every row ",
+                          "before the labels are used in the thesis."))
+```
+
+# 6. State Decoding
+
+## 6.1 Viterbi sequence (global decoding)
+
+Raw Viterbi indices (1..N from hmmTMB) are reordered to the clinical
+numbering via `state_remap`, then assigned the canonical labels in
+`state_levels`. The resulting factor uses the new ordering everywhere.
+
+```{r viterbi}
+viterbi_raw <- hmm$viterbi()
+viterbi_new <- state_remap[viterbi_raw]
+hmm_data$state <- factor(state_levels[viterbi_new], levels = state_levels)
+
+cat("State distribution across all patient-days (Viterbi):\n")
+print(table(hmm_data$state))
+cat("\nAs proportions:\n")
+print(round(prop.table(table(hmm_data$state)), 3))
+```
+
+## 6.2 State probabilities (local decoding)
+
+```{r state-probs}
+sp_mat <- hmm$state_probs()                                       # raw order
+# Reorder columns: column i in the new order is column state_remap_inv[i] raw
+sp_mat <- sp_mat[, state_remap_inv, drop = FALSE]
+colnames(sp_mat) <- paste0("Pr_state", 1:N_STATES)
+hmm_data <- bind_cols(hmm_data, as_tibble(sp_mat))
+```
+
+## 6.3 Trajectory plot — first 9 patients
+
+```{r trajectory-plot, fig.height=10}
+first_ids <- levels(hmm_data$ID)[1:9]
+
+traj_data <- hmm_data |>
+  filter(ID %in% first_ids) |>
+  pivot_longer(all_of(RESPONSE_VARS_SAFE),
+               names_to = "biomarker_safe", values_to = "value") |>
+  group_by(biomarker_safe) |>
+  mutate(value_clin = mapply(to_clinical, value, biomarker_safe)) |>
+  ungroup() |>
+  mutate(biomarker_lbl = factor(
+    vapply(biomarker_safe, axis_label, character(1)),
+    levels = vapply(RESPONSE_VARS_SAFE, axis_label, character(1))
+  ))
+
+traj_data |>
+  ggplot(aes(time, value_clin, colour = state, group = 1)) +
+  geom_line(linewidth = 0.5, alpha = 0.6) +
+  geom_point(size = 1.5) +
+  facet_grid(biomarker_lbl ~ ID, scales = "free_y") +
+  scale_colour_manual(values = state_colours, name = "State") +
+  labs(
+    title    = "Biomarker trajectories coloured by Viterbi state",
+    subtitle = global_scale_subtitle(),
+    x = "Day", y = "Value"
+  ) +
+  theme(legend.position = "bottom",
+        strip.text.x = element_text(size = 7),
+        strip.text.y = element_text(size = 7))
+```
+
+```{r save-fig-trajectories, echo=FALSE}
+save_fig(ggplot2::last_plot(), "fig09_final_trajectories_first9",
+         width = 12, height = 10)
+```
+
+## 6.4 State prevalence over time
+
+```{r state-prevalence, fig.height=4}
+hmm_data |>
+  count(time, state) |>
+  group_by(time) |>
+  mutate(prop = n / sum(n)) |>
+  ggplot(aes(time, prop, fill = state)) +
+  geom_col() +
+  scale_fill_manual(values = state_colours, name = "State") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "State prevalence by day of admission",
+       x = "Day", y = "Proportion of patients")
+```
+
+```{r save-fig-prevalence, echo=FALSE}
+save_fig(ggplot2::last_plot(), "fig10_final_state_prevalence",
+         width = 9, height = 4)
+```
+
+# 7. Model Visualisation
+
+## 7.1 State-dependent distributions (workflow-style)
+
+Layout:
+
+- **Covariate-free model.** Each biomarker gets one density panel
+  (model scale) plus an optional clinical-scale companion if the
+  biomarker is back-transformed (log1p) or z-scored. Densities are
+  stationary, since none of the parameters depend on time.
+
+- **Covariate-augmented model.** Each (biomarker, covariate) pair gets
+  one density panel per scale, with three sub-panels (`facet_wrap`)
+  showing the density at the **25th, 50th, 75th percentile** of that
+  covariate while every *other* covariate is held at its median (numeric)
+  or modal level (factor). This visualises how the state-conditional
+  distributions move when the covariate varies, the standard hmmTMB
+  workflow trick for inspecting Markov-switching GLM emissions.
+
+```{r plot-dist, fig.height=8, fig.width=10}
+# ── State setup ─────────────────────────────────────────────────────────
+# Recover the new (clinical) state index per row from the renumbered factor.
+viterbi_states_new <- as.integer(hmm_data$state)
+state_weights_new  <- as.numeric(
+  prop.table(table(factor(viterbi_states_new, levels = seq_len(N_STATES))))
+)
+
+# ── Helpers ─────────────────────────────────────────────────────────────
+# Build a one-row "baseline" data frame with every covariate fixed at its
+# representative value: median (numeric) or modal level (factor). Used as
+# the starting point for the per-quantile grids below. Scalars are
+# stripped of any names attribute (mean()/median() may inherit one from
+# the column and trip up hmm$predict() downstream — same gotcha as
+# Section 7.5).
+baseline_covariate_row <- function(data = hmm_data) {
+  if (!has_covariates) return(NULL)
+  out <- lapply(OBS_COVARIATES_SAFE, function(c) {
+    v <- data[[c]]
+    if (is.numeric(v)) {
+      unname(as.numeric(median(v, na.rm = TRUE)))
+    } else {
+      tab <- sort(table(v), decreasing = TRUE)
+      mode_lvl <- names(tab)[1]
+      if (is.factor(v)) factor(mode_lvl, levels = levels(v)) else mode_lvl
+    }
+  })
+  names(out) <- OBS_COVARIATES_SAFE
+  as.data.frame(out, stringsAsFactors = FALSE)
+}
+
+# For a focus covariate, build a 3-row newdata that varies it on Q25/Q50/Q75
+# while every other covariate stays at its baseline value. For categorical
+# focus covariates we use the three most frequent levels (or all of them
+# if there are <= 3).
+build_focus_newdata <- function(focus_cov_safe, data = hmm_data) {
+  base <- baseline_covariate_row(data)
+  v <- data[[focus_cov_safe]]
+  if (is.numeric(v)) {
+    qs <- quantile(v, probs = c(0.05, 0.50, 0.95), na.rm = TRUE,
+               names = FALSE, type = 7)
+    labs <- c("Q05", "Q50", "Q95")
+    vals <- unname(as.numeric(qs))
+  } else {
+    tab <- sort(table(v), decreasing = TRUE)
+    n_show <- min(3L, length(tab))
+    vals <- names(tab)[seq_len(n_show)]
+    labs <- vals
+    if (is.factor(v)) vals <- factor(vals, levels = levels(v))
+  }
+  newdata <- base[rep(1, length(vals)), , drop = FALSE]
+  newdata[[focus_cov_safe]] <- vals
+  rownames(newdata) <- NULL
+  list(newdata = newdata, labs = labs, vals = vals)
+}
+
+# Pull (mu, sd) per state at a SINGLE time slice of obspar.
+# `obs_par_slice` is the (par x state) matrix already permuted to CLINICAL
+# state order. Returns mu / sd vectors of length N_STATES in clinical
+# ordering.
+get_state_mu_sd_from_slice <- function(b_idx, biomarker_safe, obs_par_slice) {
+  if (IS_a_MVN) {
+    mu_row <- paste0("z.mu", b_idx); sd_row <- paste0("z.sd", b_idx)
+  } else {
+    mu_row <- paste0(biomarker_safe, ".mean")
+    sd_row <- paste0(biomarker_safe, ".sd")
+  }
+  list(mu = obs_par_slice[mu_row, ],
+       sd = obs_par_slice[sd_row, ])
+}
+
+# Build the long-format density data frame for ONE (biomarker, scale,
+# covariate-slice) panel. obs_par_slice is already in CLINICAL state order.
+build_density_long <- function(b_idx, biomarker_safe, obs_par_slice,
+                               grid_model, scale = c("model", "clinical")) {
+  scale <- match.arg(scale)
+  ms <- get_state_mu_sd_from_slice(b_idx, biomarker_safe, obs_par_slice)
+
+  dens_state <- lapply(seq_len(N_STATES), function(s) {
+    data.frame(
+      x_model = grid_model,
+      density = state_weights_new[s] * dnorm(grid_model, ms$mu[s], ms$sd[s]),
+      state   = factor(state_levels[s], levels = state_levels)
+    )
+  }) |> do.call(rbind, args = _)
+
+  if (scale == "model") {
+    dens_state$x_plot <- dens_state$x_model
+  } else {
+    dens_state$x_plot <- to_clinical(dens_state$x_model, biomarker_safe)
+    # Jacobians to preserve area = 1 under the back-transform.
+    if (isTRUE(needs_expm1[[biomarker_safe]])) {
+      dens_state$density <- dens_state$density / (1 + dens_state$x_plot)
+    }
+    if (APPLY_ZSCORE) {
+      sd0 <- zscore_params$sd[zscore_params$biomarker == biomarker_safe]
+      dens_state$density <- dens_state$density / sd0
+    }
+  }
+
+  # Total mixture density across states, per grid point.
+  dens_total <- dens_state |>
+    group_by(x_plot) |>
+    summarise(density = sum(density), .groups = "drop")
+
+  list(state = dens_state, total = dens_total)
+}
+
+# Render ONE panel (= one biomarker, one scale, optionally faceted by
+# covariate slices). Returns a ggplot object.
+render_panel <- function(b_idx, biomarker_safe, scale,
+                         slices_df = NULL) {
+  # slices_df: a long data.frame with columns
+  #   x_plot, density, state, slice_label
+  # plus a separate "total" df with x_plot/density/slice_label.
+  # If NULL we are in the covariate-free case and slices_df is built from
+  # a single obs_par_t1 slice (no facets).
+
+  obs_vals_model <- hmm_data[[biomarker_safe]]
+  rng <- range(obs_vals_model, na.rm = TRUE)
+  grid_model <- seq(rng[1] - 0.1 * diff(rng),
+                    rng[2] + 0.1 * diff(rng),
+                    length.out = 400)
+
+  if (is.null(slices_df)) {
+    obs_par_clinical <- hmm$par()$obspar[, , 1][, state_remap_inv, drop = FALSE]
+    dens <- build_density_long(b_idx, biomarker_safe, obs_par_clinical,
+                               grid_model, scale = scale)
+    dens$state$slice_label <- "(no covariate)"
+    dens$total$slice_label <- "(no covariate)"
+    slices_df <- list(state = dens$state, total = dens$total)
+  }
+
+  x_obs <- if (scale == "model") obs_vals_model
+           else to_clinical(obs_vals_model, biomarker_safe)
+
+  x_lab    <- if (scale == "model") paste0(display(biomarker_safe), " (model scale)")
+              else axis_label(biomarker_safe)
+  subtitle <- if (scale == "clinical") "Back-transformed (Jacobian applied)" else NULL
+
+  p <- ggplot() +
+    geom_histogram(data = data.frame(x = x_obs),
+                   aes(x = x, y = after_stat(density)),
+                   bins = 40, fill = "grey80", colour = "white", alpha = 0.7) +
+    geom_line(data = slices_df$state,
+              aes(x = x_plot, y = density, colour = state),
+              linewidth = 0.9) +
+    geom_line(data = slices_df$total,
+              aes(x = x_plot, y = density),
+              colour = "grey30", linetype = "dashed", linewidth = 0.7) +
+    scale_colour_manual(values = state_colours, name = NULL) +
+    labs(title = display(biomarker_safe), subtitle = subtitle,
+         x = x_lab, y = "Density") +
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 10),
+          plot.subtitle = element_text(size = 8))
+
+  # Facet only when we have more than one slice.
+  if (length(unique(slices_df$state$slice_label)) > 1L) {
+    p <- p + facet_wrap(~ slice_label, scales = "fixed")
+  }
+
+  # Clinical reference interval, drawn on whichever scale the panel uses:
+  # native units on the clinical axis, forwarded through to_model() (log1p
+  # where flagged + z-score) on the model axis.
+  ri <- ref_by_safe(biomarker_safe)
+  if (!is.null(ri)) {
+    bounds <- c(ri$lln, ri$uln)
+    if (scale == "model") bounds <- to_model(bounds, biomarker_safe)
+    p <- p +
+      annotate("rect", xmin = bounds[1], xmax = bounds[2],
+               ymin = -Inf, ymax = Inf, alpha = 0.06, fill = "forestgreen") +
+      geom_vline(xintercept = bounds,
+                 linetype = "dashed", colour = "grey40", linewidth = 0.5)
+  }
+  p
+}
+
+# ── Drivers ─────────────────────────────────────────────────────────────
+if (!has_covariates) {
+  # ---- Covariate-free path (legacy behaviour) ----
+  model_panels <- lapply(seq_along(RESPONSE_VARS_SAFE), function(i)
+    render_panel(i, RESPONSE_VARS_SAFE[i], "model", slices_df = NULL))
+  print(
+    wrap_plots(model_panels, ncol = min(length(model_panels), 2)) +
+      plot_annotation(
+        title    = "State-dependent distributions — model scale",
+        subtitle = "Solid: state-specific normal density × Pr(state). Dashed grey: total mixture."
+      )
+  )
+
+  needs_clinical <- vapply(RESPONSE_VARS_SAFE,
+    function(b) isTRUE(needs_expm1[[b]]) || APPLY_ZSCORE,
+    logical(1))
+  if (any(needs_clinical)) {
+    clin_idx <- which(needs_clinical)
+    clinical_panels <- lapply(clin_idx, function(i)
+      render_panel(i, RESPONSE_VARS_SAFE[i], "clinical", slices_df = NULL))
+    print(
+      wrap_plots(clinical_panels, ncol = min(length(clinical_panels), 2)) +
+        plot_annotation(
+          title    = "State-dependent distributions — clinical scale (back-transformed)",
+          subtitle = "Same densities with the log1p / z-score Jacobian applied to preserve area = 1."
+        )
+    )
+  }
+
+} else {
+  # ---- Covariate-augmented path: one plot per (covariate, biomarker, scale)
+  # with three facets (Q25/Q50/Q75 of the focus covariate). ----
+  for (focus_cov in OBS_COVARIATES_SAFE) {
+    focus_disp <- display(focus_cov)
+    cat("\n\n### Effects of `", focus_disp, "` on state distributions\n\n",
+        sep = "")
+
+    fb <- build_focus_newdata(focus_cov)
+    newdata <- fb$newdata
+    slice_labels <- paste0(focus_disp, " = ",
+                           if (is.numeric(fb$vals)) sprintf("%.3g", fb$vals)
+                           else as.character(fb$vals),
+                           " (", fb$labs, ")")
+
+    # hmm$predict("obspar", newdata = ...) returns a [par, state, time] array
+    # with `state` in RAW order. Permute to clinical ordering once per slice.
+    pred <- hmm$predict("obspar", newdata = newdata, n_post = 0)
+    # pred dim is [n_par, N_STATES, nrow(newdata)]; permute middle dim.
+    pred_clinical <- pred[, state_remap_inv, , drop = FALSE]
+
+    for (i in seq_along(RESPONSE_VARS_SAFE)) {
+      bsafe <- RESPONSE_VARS_SAFE[i]
+
+      obs_vals_model <- hmm_data[[bsafe]]
+      rng <- range(obs_vals_model, na.rm = TRUE)
+      grid_model <- seq(rng[1] - 0.1 * diff(rng),
+                        rng[2] + 0.1 * diff(rng),
+                        length.out = 400)
+
+      for (scale in c("model", "clinical")) {
+        # Skip clinical if no back-transform is in play for this biomarker.
+        if (scale == "clinical" &&
+            !(isTRUE(needs_expm1[[bsafe]]) || APPLY_ZSCORE)) next
+
+        # Build the long data frame across all 3 slices.
+        per_slice <- lapply(seq_along(slice_labels), function(k) {
+          obs_par_slice_k <- pred_clinical[, , k]
+          d <- build_density_long(i, bsafe, obs_par_slice_k,
+                                  grid_model, scale = scale)
+          d$state$slice_label <- slice_labels[k]
+          d$total$slice_label <- slice_labels[k]
+          d
+        })
+        slices_df <- list(
+          state = do.call(rbind, lapply(per_slice, `[[`, "state")),
+          total = do.call(rbind, lapply(per_slice, `[[`, "total"))
+        )
+        # Lock facet order to match the slice ordering.
+        slices_df$state$slice_label <- factor(slices_df$state$slice_label,
+                                              levels = slice_labels)
+        slices_df$total$slice_label <- factor(slices_df$total$slice_label,
+                                              levels = slice_labels)
+
+        p <- render_panel(i, bsafe, scale, slices_df = slices_df) +
+          labs(title = paste0(display(bsafe),
+                              " — varies with ", focus_disp,
+                              if (scale == "clinical") " (clinical scale)"
+                              else " (model scale)"))
+        print(p)
+      }
+    }
+  }
+}
+```
+
+```{r save-fig-state-densities, echo=FALSE}
+if (!has_covariates && exists("model_panels")) {
+  save_fig(
+    wrap_plots(model_panels, ncol = min(length(model_panels), 2)) +
+      plot_annotation(
+        title    = "State-dependent distributions — model scale",
+        subtitle = "Solid: state-specific normal density x Pr(state). Dashed grey: total mixture."),
+    "fig11_final_state_densities_model_scale", width = 10, height = 8)
+  if (exists("clinical_panels"))
+    save_fig(
+      wrap_plots(clinical_panels, ncol = min(length(clinical_panels), 2)) +
+        plot_annotation(
+          title    = "State-dependent distributions — clinical scale (back-transformed)",
+          subtitle = "Same densities with the log1p / z-score Jacobian applied to preserve area = 1."),
+      "fig12_final_state_densities_clinical_scale", width = 10, height = 8)
+}
+```
+
+## 7.2 Transition probability matrix
+
+```{r tpm-heatmap, fig.height=4}
+# tpm has rows/cols in raw state order; permute both to the new order so
+# states appear consistently across all plots.
+tpm_est_raw <- hmm$par()$tpm[, , 1]
+tpm_est     <- tpm_est_raw[state_remap_inv, state_remap_inv, drop = FALSE]
+rownames(tpm_est) <- paste0("From ", state_levels)
+colnames(tpm_est) <- paste0("To ",   state_levels)
+
+as.data.frame(tpm_est) |>
+  rownames_to_column("from") |>
+  pivot_longer(-from, names_to = "to", values_to = "prob") |>
+  mutate(
+    from = factor(from, levels = paste0("From ", state_levels)),
+    to   = factor(to,   levels = paste0("To ",   state_levels))
+  ) |>
+  ggplot(aes(to, from, fill = prob)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(prob, 3)), size = 3.5) +
+  scale_fill_gradient(low = "white", high = "#1a6faf", limits = c(0, 1)) +
+  labs(title = "Estimated transition probability matrix",
+       x = "To state", y = "From state", fill = "Probability") +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+```{r save-fig-tpm, echo=FALSE}
+save_fig(ggplot2::last_plot(), "fig13_final_transition_matrix",
+         width = 7, height = 5)
+```
+
+## 7.3 MVN state-dependent correlation matrices
+
+```{r mvn-corr-heatmap, fig.height=5, eval=IS_a_MVN}
+if(IS_a_MVN){
+  n_vars   <- length(RESPONSE_VARS_SAFE)
+  # Permute columns to clinical state order so facet labels match the rest
+  # of the notebook.
+  obs_pars <- hmm$par()$obspar[, , 1][, state_remap_inv, drop = FALSE]
+  
+  # hmmTMB stores correlations as "z.corrXY" with X < Y. Use upper.tri to get
+  # (i, j) with i < j directly.
+  pairs      <- which(upper.tri(matrix(0, n_vars, n_vars)), arr.ind = TRUE)
+  corr_names <- paste0("z.corr", pairs[, 1], pairs[, 2])
+  
+  missing_corr <- setdiff(corr_names, rownames(obs_pars))
+  if (length(missing_corr) > 0)
+    warning("Some correlation parameters not found in obspar: ",
+            paste(missing_corr, collapse = ", "))
+  
+  corr_df <- do.call(rbind, lapply(1:N_STATES, function(s) {
+    do.call(rbind, lapply(seq_len(nrow(pairs)), function(k) {
+      i <- pairs[k, 1]; j <- pairs[k, 2]
+      nm <- corr_names[k]
+      rho <- if (nm %in% rownames(obs_pars)) obs_pars[nm, s] else NA_real_
+      # s is now the NEW state index (columns reordered above)
+      data.frame(state = state_levels[s],
+                 var_i = RESPONSE_VARS[i],   # display names directly
+                 var_j = RESPONSE_VARS[j],
+                 rho   = rho)
+    }))
+  }))
+  
+  corr_full <- bind_rows(
+    corr_df,
+    corr_df |> rename(var_i = var_j, var_j = var_i),
+    data.frame(
+      state = rep(state_levels, each = n_vars),
+      var_i = rep(RESPONSE_VARS, N_STATES),
+      var_j = rep(RESPONSE_VARS, N_STATES),
+      rho   = 1
+    )
+  )
+  
+  corr_full$state <- factor(corr_full$state, levels = state_levels)
+  corr_full$var_i <- factor(corr_full$var_i, levels = RESPONSE_VARS)
+  corr_full$var_j <- factor(corr_full$var_j, levels = rev(RESPONSE_VARS))
+  
+  ggplot(corr_full, aes(var_i, var_j, fill = rho)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = ifelse(!is.na(rho), sprintf("%.2f", rho), "")),
+              size = 3) +
+    facet_wrap(~ state, ncol = N_STATES) +
+    scale_fill_gradient2(low = "#d73027", mid = "white", high = "#1a6faf",
+                         midpoint = 0, limits = c(-1, 1),
+                         name = "Pearson\ncorrelation") +
+    labs(title = "Fitted state-dependent correlation matrices (MVN model)",
+         subtitle = "Correlations are scale-free (log1p back-transform does not affect them)",
+         x = NULL, y = NULL) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8),
+          axis.text.y = element_text(size = 8))
+}
+```
+
+```{r save-fig-state-correlations, echo=FALSE, eval=IS_a_MVN}
+save_fig(ggplot2::last_plot(), "fig14_final_state_correlations",
+         width = 10, height = 4)
+```
+
+## 7.4 Stationary state distribution
+
+```{r stationary, fig.height=4}
+# Solve the stationary equation on the RAW TPM, then permute the resulting
+# probability vector to clinical state order.
+tpm_m <- hmm$par()$tpm[, , 1]
+K     <- nrow(tpm_m)
+A     <- t(tpm_m - diag(K))
+A     <- rbind(A, rep(1, K))
+b_vec <- c(rep(0, K), 1)
+pi_stat_raw <- as.numeric(solve(t(A) %*% A, t(A) %*% b_vec))
+pi_stat     <- pi_stat_raw[state_remap_inv]
+names(pi_stat) <- state_levels
+
+cat("Stationary state probabilities:\n")
+print(round(pi_stat, 4))
+
+data.frame(state = factor(names(pi_stat), levels = state_levels),
+           prob  = as.numeric(pi_stat)) |>
+  ggplot(aes(state, prob, fill = state)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(prob, 3)), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = state_colours) +
+  labs(title = "Stationary state distribution",
+       x = "State", y = "Probability") +
+  ylim(0, max(pi_stat) * 1.15)
+```
+
+```{r save-fig-stationary, echo=FALSE}
+save_fig(ggplot2::last_plot(), "fig15_final_stationary_distribution",
+         width = 7, height = 4.5)
+```
+
+## 7.5 Covariate effects on state-specific means
+
+We now allow the state-specific mean of each response biomarker to depend
+linearly on the configured covariates. This corresponds to a Markov-switching
+generalised linear model — an extension of Markov-switching regression — in
+which the state-process $\{S_t\}$ retains its Markov structure but each
+emission distribution carries its own intercept-plus-slope mean function:
+
+$$
+Y_{t,k}\,|\,\{S_t = j\} \;\sim\; \mathcal{N}\!\bigl(\mu_{j,k},\,\sigma_{j,k}\bigr),
+\qquad
+\mu_{j,k} \;=\; \beta^{(j,k)}_{0} \;+\; \sum_{\ell=1}^{p}\beta^{(j,k)}_{\ell}\,x_{\ell,t},
+$$
+
+for biomarker $k \in \{1,\dots,K\}$, state $j \in \{1,\dots,N\}$, and
+covariate vector $\mathbf{x}_t = (x_{1,t},\dots,x_{p,t})^\top$. Here
+$\beta^{(j,k)}_{0}$ is the state-and-biomarker-specific intercept and
+$\beta^{(j,k)}_{\ell}$ the slope of covariate $\ell$ on the mean of
+biomarker $k$ in state $j$. Standard deviations $\sigma_{j,k}$ and
+(for MVN models) state-conditional correlations are kept covariate-free
+for interpretability. This specification is exactly what we encoded in
+Section 4.4 via the nested `formulas` argument to `Observation$new()`.
+
+For each (covariate × response biomarker) pair we visualise the fitted
+$\mu_{j,k}$ as a function of that covariate, with observations from each
+Viterbi state overlaid for context.
+
+```{r covariate-effects, fig.width=10, fig.height=4.5, eval=has_covariates}
+# hmm$plot() emits the state factor as "State 1".."State N" in RAW
+# order (the order hmmTMB picked at fit time). Override its colour /
+# fill scales so each raw state shows the clinical colour and label
+# defined by state_remap (Section 1.1). Legend order is also forced
+# to the clinical sequence.
+raw_state_keys <- paste0("State ", seq_len(N_STATES))
+plot_colours   <- setNames(
+  state_colours[state_levels[state_remap[seq_len(N_STATES)]]],
+  raw_state_keys
+)
+plot_labels    <- setNames(
+  state_levels[state_remap[seq_len(N_STATES)]],
+  raw_state_keys
+)
+legend_breaks  <- raw_state_keys[state_remap_inv]
+
+for (cov_safe in OBS_COVARIATES_SAFE) {
+  cov_disp <- display(cov_safe)
+  cat("\n\n### Effects of `", cov_disp, "`\n\n", sep = "")
+
+  for (i in seq_along(RESPONSE_VARS_SAFE)) {
+    bsafe  <- RESPONSE_VARS_SAFE[i]
+    bdisp  <- display(bsafe)
+    par_id <- if (IS_a_MVN) paste0("z.mu", i) else paste0(bsafe, ".mean")
+
+    # Overlay observations: hmm_data$state is already in CLINICAL levels
+    # (from Section 6.1); remap back to the raw "State r" keys that
+    # hmm$plot() uses, so colours line up with the curves.
+    obs_df <- data.frame(
+      x     = hmm_data[[cov_safe]],
+      y     = hmm_data[[bsafe]],
+      state = factor(
+        raw_state_keys[match(as.character(hmm_data$state),
+                             state_levels[state_remap[seq_len(N_STATES)]])],
+        levels = raw_state_keys
+      )
+    )
+
+    p <- hmm$plot("obspar", cov_safe, i = par_id) +
+      geom_point(data = obs_df,
+                 aes(x = x, y = y, fill = state, col = state),
+                 alpha = 0.3) +
+      scale_colour_manual(values = plot_colours,
+                          labels = plot_labels,
+                          breaks = legend_breaks,
+                          name   = "State") +
+      scale_fill_manual  (values = plot_colours,
+                          labels = plot_labels,
+                          breaks = legend_breaks,
+                          name   = "State") +
+      labs(title = paste0(bdisp, " vs ", cov_disp),
+           x = cov_disp,
+           y = axis_label(bsafe))
+    print(p)
+  }
+}
+```
+---
+
+## 7.6 Coefficient forest plots (covariate-augmented models)
+
+Forest-style plots of the linear-predictor coefficients with 95% CI.
+Two panels: one for **observation-mean** coefficients (one per
+biomarker), one for **transition-probability** coefficients (one per
+covariate, faceted by transition).
+
+Coefficients whose CI crosses zero are greyed out — they are
+indistinguishable from "no effect" at the 95% level. Style adapted
+from the supervisor's PRS plotting code.
+
+This section runs only when `has_covariates == TRUE`. For spline terms
+the per-basis coefficients are technically uninterpretable singly;
+read effect direction via Section 7.5 plots and use this section only
+to spot which terms have CI well away from zero.
+
+```{r cov-coeff-setup, eval=has_covariates, echo=FALSE}
+.coeff_n_resp <- length(RESPONSE_VARS_SAFE)
+.coeff_obs_h  <- max(4, 2.2 * .coeff_n_resp + 1)
+knitr::opts_chunk$set(fig.width = 10, fig.height = .coeff_obs_h)
+```
+
+```{r coefficient-plots-obs, eval=has_covariates}
+# ---- 1) Observation-mean coefficients --------------------------------------
+# Defensive guard: if somebody runs this chunk manually with no covariates,
+# bail out cleanly instead of crashing downstream on an empty data frame.
+if (!has_covariates) {
+  cat("No covariates configured — coefficient plot skipped.\n")
+} else {
+ci_obs <- hmm$confint()$coeff_fe$obs
+
+obs_df_full <- as.data.frame(ci_obs) |>
+  rownames_to_column("param")
+
+# Param naming convention:
+#   MVN:        "z.mu<i>.state<s>.<term>"
+#   indep norm: "<bsafe>.mean.state<s>.<term>"
+# Parse out (response biomarker, state, term) and skip pure intercepts.
+
+parse_obs_param <- function(param) {
+  # Try MVN form first
+  m <- regmatches(param, regexec("^z\\.mu(\\d+)\\.state(\\d+)\\.(.+)$", param))[[1]]
+  if (length(m) == 4) {
+    i_idx <- as.integer(m[2]); state <- as.integer(m[3]); term <- m[4]
+    bsafe <- RESPONSE_VARS_SAFE[i_idx]
+    return(list(bsafe = bsafe, state = state, term = term))
+  }
+  # Independent-normals form: try each response prefix
+  for (i in seq_along(RESPONSE_VARS_SAFE)) {
+    bsafe <- RESPONSE_VARS_SAFE[i]
+    pat   <- paste0("^", bsafe, "\\.mean\\.state(\\d+)\\.(.+)$")
+    m <- regmatches(param, regexec(pat, param))[[1]]
+    if (length(m) == 3) {
+      return(list(bsafe = bsafe, state = as.integer(m[2]), term = m[3]))
+    }
+  }
+  NULL
+}
+
+parsed <- lapply(obs_df_full$param, parse_obs_param)
+keep   <- !vapply(parsed, is.null, logical(1))
+obs_df <- obs_df_full[keep, , drop = FALSE]
+obs_df$bsafe <- vapply(parsed[keep], `[[`, character(1), "bsafe")
+obs_df$state_raw <- vapply(parsed[keep], `[[`, integer(1),  "state")
+obs_df$term  <- vapply(parsed[keep], `[[`, character(1), "term")
+
+# Convert raw state index to the clinical (display) ordering
+obs_df$state <- state_remap[obs_df$state_raw]
+
+# Drop intercepts (they are part of the model but not a "covariate effect")
+obs_df <- obs_df[obs_df$term != "(Intercept)", ]
+
+# Display labels: replace safe covariate names inside the term string
+for (j in seq_along(OBS_COVARIATES)) {
+  obs_df$term <- gsub(OBS_COVARIATES_SAFE[j], OBS_COVARIATES[j],
+                      obs_df$term, fixed = TRUE)
+}
+
+obs_df$bdisp      <- vapply(obs_df$bsafe, display, character(1))
+obs_df$state_lbl  <- factor(state_levels[obs_df$state], levels = state_levels)
+obs_df$cross_zero <- with(obs_df, lcl <= 0 & ucl >= 0)
+obs_df$y_label    <- with(obs_df, paste0(term, "  (", state_lbl, ")"))
+
+# Per-biomarker ordering of y axis so within each facet coefficients are
+# sorted by mle (small-to-large bottom-to-top after the rev())
+obs_df <- obs_df |>
+  group_by(bdisp) |>
+  arrange(mle, .by_group = TRUE) |>
+  mutate(y_label = factor(y_label, levels = unique(y_label))) |>
+  ungroup()
+
+# state_colours is the canonical palette built in section 1.1; use it here.
+
+ggplot(obs_df, aes(x = mle, y = y_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+  geom_errorbarh(aes(xmin = lcl, xmax = ucl,
+                     colour = ifelse(cross_zero, "cross zero",
+                                     as.character(state_lbl))),
+                 height = 0.2, linewidth = 0.5) +
+  geom_point(aes(colour = ifelse(cross_zero, "cross zero",
+                                 as.character(state_lbl))),
+             size = 2.5) +
+  facet_wrap(~ bdisp, scales = "free_y", ncol = 1) +
+  scale_colour_manual(
+    values = c("cross zero" = "grey70", state_colours),
+    name   = NULL
+  ) +
+  labs(title = "Observation-mean coefficients (β with 95% CI)",
+       subtitle = "Greyed out: CI crosses zero. One facet per response biomarker.",
+       x = "Coefficient β",
+       y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text      = element_text(face = "bold"),
+        plot.title      = element_text(face = "bold"))
+}  # end defensive-guard else
+```
+
+```{r coefficient-plots-tpm, eval=has_covariates, fig.width=10, fig.height=6}
+# ---- 2) Transition-probability coefficients -------------------------------
+if (!has_covariates) {
+  cat("No covariates configured — transition coefficient plot skipped.\n")
+} else {
+
+ci_tpm <- hmm$confint()$coeff_fe$hid
+
+tpm_df <- as.data.frame(ci_tpm) |>
+  rownames_to_column("param") |>
+  filter(grepl("^S\\d+>S\\d+\\.", param))
+
+if (nrow(tpm_df) == 0) {
+  cat("Hidden state process has no covariate effects (covariate-free transitions).\n")
+} else {
+  tpm_df <- tpm_df |>
+    mutate(
+      from_raw = as.integer(sub("^S(\\d+)>.*",       "\\1", param)),
+      to_raw   = as.integer(sub(".*>S(\\d+)\\..*$",  "\\1", param)),
+      from     = state_remap[from_raw],
+      to       = state_remap[to_raw],
+      term     = sub("^S\\d+>S\\d+\\.",              "",    param),
+      transition = paste0(state_levels[from], " \u2192 ", state_levels[to])
+    ) |>
+    filter(term != "(Intercept)")
+
+  # Replace safe covariate names with display names
+  for (j in seq_along(OBS_COVARIATES)) {
+    tpm_df$term <- gsub(OBS_COVARIATES_SAFE[j], OBS_COVARIATES[j],
+                        tpm_df$term, fixed = TRUE)
+  }
+
+  tpm_df <- tpm_df |>
+    group_by(transition) |>
+    arrange(mle, .by_group = TRUE) |>
+    mutate(
+      y_label    = paste0(term, "  (", transition, ")"),
+      y_label    = factor(y_label, levels = unique(y_label)),
+      cross_zero = lcl <= 0 & ucl >= 0
+    ) |>
+    ungroup()
+
+  ggplot(tpm_df, aes(y = y_label, x = mle)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+    geom_errorbarh(aes(xmin = lcl, xmax = ucl,
+                       colour = ifelse(cross_zero, "crosses 0",
+                                       "does not cross 0")),
+                   height = 0.18, linewidth = 0.5) +
+    geom_point(aes(colour = ifelse(cross_zero, "crosses 0",
+                                   "does not cross 0")),
+               size = 2.5) +
+    scale_colour_manual(values = c("crosses 0" = "grey70",
+                                   "does not cross 0" = "#1a6faf"),
+                        name = NULL) +
+    labs(title = "Transition-probability coefficients (β with 95% CI)",
+         subtitle = "Greyed out: CI crosses zero.",
+         x = expression(beta ~ "(MLE)"),
+         y = NULL) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title      = element_text(face = "bold"))
+}
+}  # end defensive-guard else
+```
+
+```{r cov-coeff-reset, eval=has_covariates, echo=FALSE}
+knitr::opts_chunk$set(fig.width = 10, fig.height = 6)
+```
+
+# 8. Estimated Parameters Summary
+
+```{r param-summary}
+if (has_covariates) {
+  cat("Linear-predictor coefficients on observation parameters",
+      "(intercepts + slopes per state):\n\n")
+  print(round(hmm$coeff_fe()$obs, 3))
+  cat("\n\nFor reference, observation parameters at the first data row",
+      "(t = 1) are shown below in clinical units.\n\n")
+}
+
+obs_par <- hmm$par()$obspar[, , 1]   # rows = params, cols = states (raw)
+# Permute columns to clinical state order
+obs_par <- obs_par[, state_remap_inv, drop = FALSE]
+colnames(obs_par) <- state_levels
+
+# ── back-transform & build display table ────────────────────────────────
+if (IS_a_MVN) {
+  n_vars <- length(RESPONSE_VARS_SAFE)
+
+  # Correlation row names use upper.tri convention (X < Y): corr12,
+  # corr13, ..., corr_{p-1,p}. Build them in the same order hmmTMB uses.
+  corr_idx <- which(upper.tri(matrix(0, n_vars, n_vars)), arr.ind = TRUE)
+  corr_idx  <- corr_idx[order(corr_idx[, 1], corr_idx[, 2]), , drop = FALSE]
+
+  expected_mu   <- paste0("z.mu",   seq_len(n_vars))
+  expected_sd   <- paste0("z.sd",   seq_len(n_vars))
+  expected_corr <- paste0("z.corr", corr_idx[, 1], corr_idx[, 2])
+
+  # ── back-transform means and sds in-place ─────────────────────────────
+  # to_clinical()    : undo z-score then expm1 (if log1p-flagged)
+  # to_clinical_sd() : undo z-score (multiplicative) then lognormal-
+  #                    variance formula when log1p-flagged; needs
+  #                    mu_logscale = model-scale mean (before z-inversion)
+  for (i in seq_len(n_vars)) {
+    bsafe  <- RESPONSE_VARS_SAFE[i]
+    mu_row <- expected_mu[i]
+    sd_row <- expected_sd[i]
+    if (mu_row %in% rownames(obs_par)) {
+      mu_model <- obs_par[mu_row, ]           # log-scale mean for sd formula
+      obs_par[mu_row, ] <- to_clinical(obs_par[mu_row, ], bsafe)
+      if (sd_row %in% rownames(obs_par))
+        obs_par[sd_row, ] <- to_clinical_sd(obs_par[sd_row, ], bsafe,
+                                            mu_logscale = mu_model)
+    }
+  }
+
+  # ── assemble rows in the order: mean_i, sd_i, then all corr ──────────
+  # Order: mu1, sd1, mu2, sd2, ..., muP, sdP, corr12, corr13, ...
+  ordered_rows <- c(
+    as.vector(rbind(expected_mu, expected_sd)),   # interleave mean/sd
+    expected_corr
+  )
+  present      <- intersect(ordered_rows, rownames(obs_par))
+  obs_par_sub  <- obs_par[present, , drop = FALSE]
+
+  # ── human-readable row labels ─────────────────────────────────────────
+  label_mu   <- paste0(RESPONSE_VARS, " — mean")
+  label_sd   <- paste0(RESPONSE_VARS, " — sd")
+  label_ms   <- as.vector(rbind(label_mu, label_sd))   # interleaved
+  label_corr <- apply(corr_idx, 1, function(idx)
+    paste0("corr(", RESPONSE_VARS[idx[1]], ", ", RESPONSE_VARS[idx[2]], ")"))
+
+  all_labels  <- c(label_ms, label_corr)
+  all_keys    <- c(as.vector(rbind(expected_mu, expected_sd)), expected_corr)
+  rownames(obs_par_sub) <- all_labels[match(present, all_keys)]
+
+} else {
+  # ── independent-normals branch ────────────────────────────────────────
+  # Back-transform each biomarker's mean and sd, then reorder rows to
+  # mean_i / sd_i pairs and rename for display.
+  n_vars <- length(RESPONSE_VARS_SAFE)
+
+  for (i in seq_len(n_vars)) {
+    bsafe    <- RESPONSE_VARS_SAFE[i]
+    mean_row <- paste0(bsafe, ".mean")
+    sd_row   <- paste0(bsafe, ".sd")
+    if (mean_row %in% rownames(obs_par)) {
+      mu_model <- obs_par[mean_row, ]
+      obs_par[mean_row, ] <- to_clinical(obs_par[mean_row, ], bsafe)
+      if (sd_row %in% rownames(obs_par))
+        obs_par[sd_row, ] <- to_clinical_sd(obs_par[sd_row, ], bsafe,
+                                            mu_logscale = mu_model)
+    }
+  }
+
+  # Interleave mean / sd rows per biomarker
+  mean_rows <- paste0(RESPONSE_VARS_SAFE, ".mean")
+  sd_rows   <- paste0(RESPONSE_VARS_SAFE, ".sd")
+  ordered_rows <- as.vector(rbind(mean_rows, sd_rows))
+  present      <- intersect(ordered_rows, rownames(obs_par))
+  obs_par_sub  <- obs_par[present, , drop = FALSE]
+
+  # Display names
+  label_mean <- paste0(RESPONSE_VARS, " — mean")
+  label_sd   <- paste0(RESPONSE_VARS, " — sd")
+  all_labels <- as.vector(rbind(label_mean, label_sd))
+  all_keys   <- as.vector(rbind(mean_rows, sd_rows))
+  rownames(obs_par_sub) <- all_labels[match(present, all_keys)]
+}
+
+# ── Tidy per-state clinical mean/sd (drives Table A, heatmap, forest) ────────
+# obs_par_sub rows are "<display> — mean" / "<display> — sd" (interleaved) and,
+# for MVN, "corr(<i>, <j>)"; columns are states in display order. We keep the
+# clean (un-escaped) rownames here and read the numbers straight out.
+state_cols  <- colnames(obs_par_sub)           # state_levels in display order
+header_cols <- unname(state_colours[state_cols])
+em_dash     <- " — "                            # same dash used in the labels
+
+escape_latex <- function(x) {
+  x <- gsub("(\\d+)\\^(\\d+)", "$\\1^{\\2}$", x, perl = TRUE)
+  x <- gsub("_",  "\\\\_", x, fixed = TRUE)
+  x <- gsub("%",  "\\\\%", x, fixed = TRUE)
+  x
+}
+
+get_par_row <- function(bd, suffix) {
+  key <- paste0(bd, em_dash, suffix)
+  if (key %in% rownames(obs_par_sub)) as.numeric(obs_par_sub[key, ])
+  else rep(NA_real_, length(state_cols))
+}
+
+param_tidy <- do.call(rbind, lapply(RESPONSE_VARS, function(bd) {
+  ri <- ref_mean_sd(bd)
+  data.frame(
+    biomarker = bd,
+    state     = factor(state_cols, levels = state_cols),
+    mean      = get_par_row(bd, "mean"),
+    sd        = get_par_row(bd, "sd"),
+    lln       = if (is.null(ri)) NA_real_ else ri$lln,
+    uln       = if (is.null(ri)) NA_real_ else ri$uln,
+    row.names = NULL, check.names = FALSE, stringsAsFactors = FALSE
+  )
+}))
+
+# ── Table A: one row per biomarker, cell = "mean (sd)" + out-of-range flag ───
+flag_of <- function(mu, lln, uln) {
+  if (is.na(mu)) return("")
+  if (!is.na(lln) && mu < lln) return(" $\\downarrow$")
+  if (!is.na(uln) && mu > uln) return(" $\\uparrow$")
+  ""
+}
+tableA <- data.frame(Biomarker = escape_latex(RESPONSE_VARS),
+                     check.names = FALSE, stringsAsFactors = FALSE)
+for (st in state_cols) {
+  tableA[[st]] <- vapply(RESPONSE_VARS, function(bd) {
+    r <- param_tidy[param_tidy$biomarker == bd & as.character(param_tidy$state) == st, ]
+    if (nrow(r) == 0 || is.na(r$mean)) return("")
+    paste0(sprintf("%.3g (%.2g)", r$mean, r$sd), flag_of(r$mean, r$lln, r$uln))
+  }, character(1))
+}
+tableA[["Normal range"]] <- vapply(RESPONSE_VARS, function(bd) {
+  ri <- ref_mean_sd(bd)
+  if (is.null(ri)) "" else sprintf("[%.3g, %.3g]", ri$lln, ri$uln)
+}, character(1))
+
+tbl <- knitr::kable(
+  tableA,
+  format    = "latex",
+  booktabs  = TRUE,
+  escape    = FALSE,
+  row.names = FALSE,
+  align     = c("l", rep("c", length(state_cols)), "c"),
+  caption   = paste0(
+    if (IS_a_MVN) "Estimated MVN" else "Estimated",
+    " state-dependent parameters",
+    if (has_covariates) " at $t=1$ (intercepts only)" else "",
+    " in clinical units. Cell = mean (sd); $\\downarrow$/$\\uparrow$ mark a state ",
+    "mean below/above the normal range. Correlations are shown in the heatmap below."
+  )
+) |>
+  kableExtra::kable_styling(
+    latex_options = c("striped", "hold_position"),
+    full_width    = FALSE
+  )
+
+for (j in seq_along(state_cols)) {
+  tbl <- tbl |>
+    kableExtra::column_spec(j + 1L,
+      color = header_cols[j],
+      bold  = TRUE)
+}
+
+tbl
+```
+
+## 8.1 State-dependent correlations (MVN)
+
+```{r param-corr-heatmap, fig.width=9, fig.height=3.6, eval=IS_a_MVN}
+if (IS_a_MVN && exists("corr_idx") && nrow(corr_idx) > 0) {
+  corr_tidy <- do.call(rbind, lapply(seq_len(nrow(corr_idx)), function(k) {
+    i <- corr_idx[k, 1]; j <- corr_idx[k, 2]
+    lab <- paste0("corr(", RESPONSE_VARS[i], ", ", RESPONSE_VARS[j], ")")
+    if (!(lab %in% rownames(obs_par_sub))) return(NULL)
+    vals <- as.numeric(obs_par_sub[lab, ])
+    rbind(
+      data.frame(state = state_cols, v1 = RESPONSE_VARS[i], v2 = RESPONSE_VARS[j], corr = vals),
+      data.frame(state = state_cols, v1 = RESPONSE_VARS[j], v2 = RESPONSE_VARS[i], corr = vals)
+    )
+  }))
+  diag_df <- do.call(rbind, lapply(RESPONSE_VARS, function(v)
+    data.frame(state = state_cols, v1 = v, v2 = v, corr = 1)))
+  corr_tidy <- rbind(corr_tidy, diag_df)
+  corr_tidy$state <- factor(corr_tidy$state, levels = state_cols)
+  corr_tidy$v1    <- factor(corr_tidy$v1,    levels = RESPONSE_VARS)
+  corr_tidy$v2    <- factor(corr_tidy$v2,    levels = rev(RESPONSE_VARS))
+
+  ggplot(corr_tidy, aes(v1, v2, fill = corr)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%.2f", corr)), size = 2.6) +
+    facet_wrap(~ state, nrow = 1) +
+    scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                         midpoint = 0, limits = c(-1, 1), name = "corr") +
+    labs(title = "State-dependent correlations (MVN emission)", x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1),
+          panel.grid  = element_blank(),
+          legend.position = "right")
+} else {
+  cat("No MVN correlations to display.\n")
+}
+```
+
+```{r save-fig-param-correlations, echo=FALSE, eval=IS_a_MVN}
+save_fig(ggplot2::last_plot(), "fig16_final_parameter_correlations",
+         width = 9, height = 3.6)
+```
+
+## 8.2 State intervals vs clinical normal range
+
+```{r param-forest, fig.width=9, fig.height=3.8}
+# For each biomarker: state mean +/- 2 SD (clinical) against the [LLN, ULN] band.
+band_df <- param_tidy |>
+  dplyr::distinct(biomarker, lln, uln) |>
+  dplyr::filter(!is.na(lln), !is.na(uln))
+
+ggplot(param_tidy, aes(y = state, colour = state)) +
+  geom_rect(data = band_df, inherit.aes = FALSE,
+            aes(xmin = lln, xmax = uln, ymin = -Inf, ymax = Inf),
+            fill = "forestgreen", alpha = 0.10) +
+  geom_vline(data = band_df, inherit.aes = FALSE,
+             aes(xintercept = lln), linetype = "dashed",
+             colour = "grey45", linewidth = 0.4) +
+  geom_vline(data = band_df, inherit.aes = FALSE,
+             aes(xintercept = uln), linetype = "dashed",
+             colour = "grey45", linewidth = 0.4) +
+  geom_pointrange(aes(x = mean, xmin = mean - 2 * sd, xmax = mean + 2 * sd),
+                  linewidth = 0.6, fatten = 2.2) +
+  facet_wrap(~ biomarker, scales = "free_x") +
+  scale_colour_manual(values = state_colours, guide = "none") +
+  labs(title = "State intervals (mean ± 2 SD) vs clinical normal range",
+       subtitle = "Green band = [LLN, ULN]; point = state mean, whiskers = ±2 SD (clinical units)",
+       x = "Clinical value", y = NULL) +
+  theme_minimal(base_size = 9)
+```
+
+```{r save-fig-reference-intervals, echo=FALSE}
+save_fig(ggplot2::last_plot(), "fig17_final_state_vs_reference_range",
+         width = 9, height = 3.8)
+```
+
+# 9. Model Checking
+
+## 9.1 Pseudo-residuals
+
+Under a correctly specified model, pseudo-residuals are iid $N(0,1)$. The
+QQ-plot diagnoses distributional fit and the ACF plot diagnoses temporal
+dependence not captured by the latent state process.
+
+### Univariate case
+
+For independent normals hmmTMB ships `pseudores()`, which we use directly.
+
+### Multivariate (MVN) case
+
+`hmmTMB::pseudores()` does not support `mvnorm`, so we compute the
+**ordinary pseudo-residuals** (Zucchini, MacDonald & Langrock 2017,
+§6.2.2) by hand, using a per-biomarker marginal:
+
+$$
+z_{it} \;=\; \Phi^{-1}\!\big(\Pr(X_{it} \le x_{it} \mid X_{(-it)})\big)
+$$
+
+with
+
+$$
+\Pr(X_{it} \le x_{it} \mid X_{(-it)})
+\;=\;
+\frac{\tilde\alpha(t{-}1)\,\Gamma\,\mathrm{diag}\!\big(F_{i,s}(x_{it})\big)\,\tilde\beta(t)^{\!\top}}
+     {\tilde\alpha(t{-}1)\,\Gamma\,\tilde\beta(t)^{\!\top}}
+$$
+
+where
+
+- $\tilde\alpha, \tilde\beta$ are the **scaled forward/backward** vectors,
+  computed under the *full MVN joint density* $\mathcal N_p(\mathbf x_t;\,
+  \mu_s,\,\Sigma_s)$ for each state — scaling prevents underflow and makes
+  the ratio invariant, so the normalising constants cancel;
+- $F_{i,s}$ is the **marginal** CDF of biomarker $i$ in state $s$, i.e.
+  $\mathcal N(\mu_{i,s}, \sigma_{i,s})$, extracted from the MVN by the
+  standard property that the marginal of a multivariate Normal on
+  coordinate $i$ is univariate Normal with the same mean and variance
+  $(\Sigma_s)_{ii}$ — the off-diagonal entries integrate out;
+- at $t = 1$ we use the initial distribution $\delta$ in place of
+  $\tilde\alpha(0)\,\Gamma$;
+- forward/backward are restarted independently for each patient (each
+  `ID` is an independent time series).
+
+Note this is the *proper* forward/backward-based pseudo-residual — not a
+posterior-weighted CDF via `state_probs()`, which would condition on
+$X_{it}$ itself and defeat the purpose of a residual diagnostic.
+
+```{r pseudo-residuals-helpers}
+# ----------------------------------------------------------------------
+# Forward/backward recursions for one patient, with row-sum scaling
+# (Zucchini, MacDonald & Langrock 2017, §3.2 / §4.1).
+#
+# Returns scaled alpha-tilde and beta-tilde such that the normalising
+# constants drop out of the numerator/denominator ratio in §6.2.2.
+#
+# Crucially, the per-row state likelihood P[t, s] = f_s(x_t) is the
+# *full multivariate* MVN density N_p(x_t; mu_s, Sigma_s), NOT the
+# product of the univariate marginals. This is what makes the resulting
+# pseudo-residual "the marginal pseudo-residual of the MVN" rather than
+# "the pseudo-residual of an independent-normals model": marginals are
+# used only inside F_{i,s}, while forward/backward use the joint density.
+# ----------------------------------------------------------------------
+forward_backward_patient <- function(x_obs, Gamma, delta, mu, Sigma_list) {
+  Ti <- nrow(x_obs)                      # length of this patient's series
+  K  <- nrow(Gamma)                      # number of latent states
+
+  # P[t, s] = f_s(x_t) = N_p(x_t; mu_s, Sigma_s), the joint MVN density.
+  # mvtnorm::dmvnorm with log = TRUE then exp() keeps things stable
+  # before the row-sum scaling below.
+  P <- matrix(NA_real_, Ti, K)
+  for (s in seq_len(K)) {
+    P[, s] <- exp(mvtnorm::dmvnorm(x_obs,
+                                   mean  = mu[s, ],
+                                   sigma = Sigma_list[[s]],
+                                   log   = TRUE))
+  }
+
+  # Forward pass with scaling: alpha_tilde[t] sums to 1 at each t,
+  # c_t collects the per-step normalising constants.
+  alpha <- matrix(0, Ti, K); c_t <- numeric(Ti)
+  phi        <- delta * P[1, ]                          # alpha_1 ∝ δ ⊙ f(x_1)
+  c_t[1]     <- sum(phi)
+  alpha[1, ] <- phi / c_t[1]
+  for (t in 2:Ti) {
+    phi        <- (alpha[t - 1, ] %*% Gamma) * P[t, ]   # α̃_{t-1} Γ ⊙ f(x_t)
+    c_t[t]     <- sum(phi)
+    alpha[t, ] <- phi / c_t[t]
+  }
+
+  # Backward pass with the same scaling convention. Setting beta_T to
+  # 1 / c_T (rather than 1) makes the products α̃_t β̃_t cancel the c_t
+  # factors cleanly when forming the conditional probabilities.
+  beta <- matrix(0, Ti, K)
+  beta[Ti, ] <- 1 / c_t[Ti]
+  for (t in (Ti - 1):1) {
+    b           <- Gamma %*% (P[t + 1, ] * beta[t + 1, ])
+    beta[t, ]   <- as.numeric(b) / c_t[t]
+  }
+
+  list(alpha = alpha, beta = beta, c_t = c_t, P = P)
+}
+
+# ----------------------------------------------------------------------
+# Extract per-state means, marginal sds, and *full* covariance matrices
+# Sigma_s from the fitted hmmTMB object.
+#
+# hmmTMB stores MVN parameters under the list-column name `z` with rows:
+#   z.mu1 ... z.muP        (means)
+#   z.sd1 ... z.sdP        (marginal sds = sqrt of diagonal of Sigma)
+#   z.corr<X><Y>           (correlations, X < Y, upper-triangle convention)
+#
+# For the independent-normals branch the convention is different
+# (<bm_safe>.mean / <bm_safe>.sd, no correlations), so we dispatch on
+# is_mvn. In the independent case Sigma_s collapses to diag(sd^2).
+# ----------------------------------------------------------------------
+extract_state_params <- function(hmm_obj, response_vars_safe, is_mvn) {
+  obs_par <- hmm_obj$par()$obspar[, , 1]
+  K <- N_STATES
+  p <- length(response_vars_safe)
+
+  mu <- sd <- matrix(NA_real_, K, p)
+  for (i in seq_len(p)) {
+    if (is_mvn) {
+      mu_row <- paste0("z.mu", i); sd_row <- paste0("z.sd", i)
+    } else {
+      mu_row <- paste0(response_vars_safe[i], ".mean")
+      sd_row <- paste0(response_vars_safe[i], ".sd")
+    }
+    mu[, i] <- obs_par[mu_row, ]
+    sd[, i] <- obs_par[sd_row, ]
+  }
+
+  # Build Sigma_s for each state: D R D, where D = diag(sd_s) and R is
+  # the correlation matrix. In the independent case R = I and Sigma_s
+  # stays diagonal.
+  Sigma_list <- vector("list", K)
+  for (s in seq_len(K)) {
+    R <- diag(p)                                   # correlation matrix
+    if (is_mvn && p >= 2) {
+      # Upper-triangle iteration matches hmmTMB's z.corr<X><Y> naming
+      # (X < Y); see CLAUDE.md note on upper.tri vs lower.tri pitfall.
+      idx <- which(upper.tri(R), arr.ind = TRUE)
+      for (k in seq_len(nrow(idx))) {
+        i <- idx[k, 1]; j <- idx[k, 2]
+        corr_row <- paste0("z.corr", i, j)
+        rho <- obs_par[corr_row, s]
+        R[i, j] <- R[j, i] <- rho
+      }
+    }
+    D  <- diag(sd[s, ], nrow = p)
+    Sigma_list[[s]] <- D %*% R %*% D               # Sigma_s = D R D
+  }
+
+  list(mu = mu, sd = sd, Sigma_list = Sigma_list)
+}
+
+# ----------------------------------------------------------------------
+# Stationary distribution as a fallback for delta when hmm$hid()$delta()
+# is not exposed. Solves delta (Γ − I) = 0 subject to 1ᵀ delta = 1 via
+# the augmented least-squares system, so we get a unique solution even
+# when Γ − I is rank-deficient (it is, by construction).
+# ----------------------------------------------------------------------
+get_initial_delta <- function(hmm_obj, Gamma) {
+  d <- tryCatch(hmm_obj$hid()$delta(), error = function(e) NULL)
+  if (!is.null(d)) {
+    d <- as.numeric(d)
+    if (length(d) == N_STATES) return(d / sum(d))
+  }
+  K <- nrow(Gamma)
+  A <- rbind(t(Gamma - diag(K)), rep(1, K))
+  b_vec <- c(rep(0, K), 1)
+  as.numeric(solve(t(A) %*% A, t(A) %*% b_vec))
+}
+```
+
+```{r pseudo-residuals, fig.height=8, cache=TRUE}
+# Diagnostic panels: QQ against N(0,1) for distributional fit, ACF for
+# residual temporal dependence the latent chain failed to absorb.
+qq_panel <- function(res, name) {
+  ggplot(data.frame(res = res), aes(sample = res)) +
+    stat_qq(alpha = 0.3, size = 0.7) +
+    stat_qq_line(colour = "red") +
+    labs(title = paste("QQ:", name), x = "Theoretical", y = "Sample")
+}
+
+acf_panel <- function(res, name, lag.max = 14) {
+  ac <- acf(res, plot = FALSE, na.action = na.pass, lag.max = lag.max)
+  ci <- 1.96 / sqrt(sum(!is.na(res)))
+  data.frame(lag = as.numeric(ac$lag[-1]),
+             acf = as.numeric(ac$acf[-1])) |>
+    ggplot(aes(lag, acf)) +
+    geom_hline(yintercept = 0) +
+    geom_hline(yintercept = c(-ci, ci),
+               linetype = "dashed", colour = "blue") +
+    geom_segment(aes(xend = lag, yend = 0)) +
+    scale_x_continuous(breaks = 1:lag.max) +
+    labs(title = paste("ACF:", name), x = "Lag (days)", y = "ACF")
+}
+
+if (IS_a_MVN) {
+  # ------------------------------------------------------------------
+  # MVN branch: implement Zucchini §6.2.2 by hand.
+  # ------------------------------------------------------------------
+  Gamma  <- hmm$par()$tpm[, , 1]                   # transition matrix Γ
+  delta  <- get_initial_delta(hmm, Gamma)          # initial distribution δ
+  pars   <- extract_state_params(hmm, RESPONSE_VARS_SAFE, is_mvn = TRUE)
+  mu     <- pars$mu                                # K × p means
+  sd_mat <- pars$sd                                # K × p marginal sds
+  Sigmas <- pars$Sigma_list                        # list of K full Σ_s
+
+  K   <- N_STATES
+  p   <- length(RESPONSE_VARS_SAFE)
+  eps <- .Machine$double.eps^0.5                   # clipping for qnorm()
+
+  pr_mat <- matrix(NA_real_, nrow = nrow(hmm_data), ncol = p)
+  colnames(pr_mat) <- RESPONSE_VARS_SAFE
+
+  # Forward/backward is restarted independently for each patient (each
+  # ID is an independent time series under the model).
+  for (id in levels(hmm_data$ID)) {
+    idx <- which(hmm_data$ID == id)
+    x   <- as.matrix(hmm_data[idx, RESPONSE_VARS_SAFE, drop = FALSE])
+    Ti  <- nrow(x)
+    if (Ti < 1) next
+
+    # Run the scaled forward/backward under the full MVN joint density.
+    fb <- forward_backward_patient(x, Gamma, delta, mu, Sigmas)
+
+    # ag[t, ] = α̃(t-1) Γ, with the convention ag[1, ] = δ in place of
+    # α̃(0) Γ (the t = 1 boundary condition in Zucchini §6.2.2). Using
+    # ag instead of α̃(t) is what makes the resulting probability
+    # *exclude* x_t from the conditioning set, i.e. produces an
+    # *ordinary* (not smoothed) pseudo-residual.
+    ag <- matrix(0, Ti, K)
+    ag[1, ] <- delta
+    if (Ti >= 2) for (t in 2:Ti) ag[t, ] <- fb$alpha[t - 1, ] %*% Gamma
+
+    # Denominator of the pseudo-residual ratio:
+    #   α̃(t-1) Γ β̃(t)ᵀ  =  Σ_s [α̃(t-1) Γ]_s · β̃_s(t)
+    # Computed once per t and shared across biomarkers. Negative or
+    # zero values would indicate numerical degeneracy (a near-impossible
+    # observation under the model); flag them as NA.
+    denom <- rowSums(ag * fb$beta)
+    denom[denom <= 0] <- NA_real_
+
+    # Loop over biomarkers. For each i we plug the *univariate marginal*
+    # CDF F_{i,s} = Φ((x − μ_{i,s}) / σ_{i,s}) into the diagonal of the
+    # numerator quadratic form, then form the conditional probability
+    # and map it through Φ⁻¹.
+    for (i in seq_len(p)) {
+      # F_mat[t, s] = F_{i,s}(x_{it}). The marginal of an MVN on
+      # coordinate i is N(μ_{i,s}, σ_{i,s}) — off-diagonals integrate
+      # out, so pnorm() is exact for the marginal CDF (we are NOT
+      # approximating by ignoring correlations here; the marginal is
+      # genuinely univariate Normal).
+      F_mat <- vapply(seq_len(K),
+        function(s) pnorm(x[, i], mean = mu[s, i], sd = sd_mat[s, i]),
+        numeric(Ti))
+
+      # Numerator: α̃(t-1) Γ diag(F_{i,s}(x_{it})) β̃(t)ᵀ
+      #         =  Σ_s [α̃(t-1) Γ]_s · F_{i,s}(x_{it}) · β̃_s(t)
+      numer <- rowSums(ag * F_mat * fb$beta)
+
+      # Conditional CDF, clipped away from 0/1 so that qnorm() returns
+      # finite values even for grossly mis-modelled observations
+      # (saturated residuals appear as ±~5.6 in the QQ-plot).
+      p_cond <- pmin(pmax(numer / denom, eps), 1 - eps)
+
+      # Normal pseudo-residual z_{it} = Φ⁻¹(p_cond). Under H_0 of a
+      # correctly specified model, these are iid N(0, 1).
+      pr_mat[idx, i] <- qnorm(p_cond)
+    }
+  }
+
+  plots_pr <- c(
+    lapply(seq_along(RESPONSE_VARS_SAFE),
+           function(i) qq_panel (pr_mat[, RESPONSE_VARS_SAFE[i]],
+                                 RESPONSE_VARS[i])),
+    lapply(seq_along(RESPONSE_VARS_SAFE),
+           function(i) acf_panel(pr_mat[, RESPONSE_VARS_SAFE[i]],
+                                 RESPONSE_VARS[i]))
+  )
+} else {
+  # ------------------------------------------------------------------
+  # Independent-normals branch: hmmTMB's pseudores() handles this case
+  # natively. Forward/backward under independence factorises exactly
+  # over biomarkers, so the library implementation is exact — no need
+  # to re-derive.
+  # ------------------------------------------------------------------
+  pr <- hmm$pseudores()
+  plots_pr <- c(
+    lapply(seq_along(RESPONSE_VARS_SAFE),
+           function(i) qq_panel (pr[[RESPONSE_VARS_SAFE[i]]],
+                                 RESPONSE_VARS[i])),
+    lapply(seq_along(RESPONSE_VARS_SAFE),
+           function(i) acf_panel(pr[[RESPONSE_VARS_SAFE[i]]],
+                                 RESPONSE_VARS[i]))
+  )
+}
+
+wrap_plots(plots_pr, ncol = 2)
+```
+
+```{r save-fig-pseudoresiduals, echo=FALSE}
+# Saves the panel produced by the (unmodified) chunk above.
+save_fig(wrap_plots(plots_pr, ncol = 2), "fig18_final_pseudoresiduals",
+         width = 10, height = 8)
+```
+
+## 9.3 AIC
+
+```{r aic, echo=FALSE}
+cat("AIC for fitted model:", round(AIC(hmm), 3), "\n")
+cat("BIC for fitted model:", round(BIC(hmm), 3), "\n")
+```
+
+# 10. State-occupancy patterns
+
+How many patients stay in a single state for their entire admission, and
+how many transition between states? This sets up the population split
+exploited by the post-hoc notebook (`hmm_posthoc.Rmd`):
+
+- **Stayers** → used to characterise each state's "central population"
+  via depth measures (Section 1 in posthoc).
+- **Switchers** → analysed as their own subgroup (Section 2 in posthoc).
+
+## 10.1 Stayers vs switchers — counts
+
+```{r stayer-counts}
+patient_states <- hmm_data |>
+  group_by(ID) |>
+  summarise(
+    n_states_visited = n_distinct(state),
+    # state is a factor with levels = state_levels (in clinical order),
+    # so as.integer(state) gives the new state index 1..N directly.
+    state_sequence   = paste(as.integer(state), collapse = "->"),
+    .groups = "drop"
+  ) |>
+  mutate(
+    pattern = if_else(n_states_visited == 1, "stayer", "switcher"),
+    sole_state = if_else(
+      n_states_visited == 1,
+      state_levels[as.integer(sub("->.*", "", state_sequence))],
+      NA_character_
+    )
+  )
+
+cat("Stayer / switcher split:\n")
+print(table(patient_states$pattern))
+
+cat("\nStayer breakdown by state:\n")
+print(table(patient_states$sole_state, useNA = "no"))
+
+cat("\nNumber of distinct states visited (per patient):\n")
+print(table(patient_states$n_states_visited))
+```
+
+```{r save-tab-occupancy, echo=FALSE}
+occ_final <- tibble::tibble(
+  quantity = c("stayers", "switchers",
+               paste0("stayers in ", state_levels)),
+  n = c(sum(patient_states$pattern == "stayer"),
+        sum(patient_states$pattern == "switcher"),
+        as.integer(table(factor(patient_states$sole_state,
+                                levels = state_levels))))
+)
+save_tab(occ_final, "tab08_final_stayers_switchers",
+         caption = "Final model: state-occupancy patterns over the admission window.")
+```
+
+## 10.2 Alluvial diagram of state sequences
+
+For visual clarity we collapse each patient's day-by-day state sequence
+to its **transition checkpoints**: day 0, day 7, day 14. Patients are
+grouped by the (S_0, S_7, S_14) triplet. Stayers form a single straight
+flow, switchers branch.
+
+```{r alluvial-all, fig.width=10, fig.height=6}
+# Lazy-install ggalluvial only if needed
+if (!requireNamespace("ggalluvial", quietly = TRUE)) {
+  install.packages("ggalluvial")
+}
+library(ggalluvial)
+
+CHECKPOINT_DAYS <- c(0, 7, 14)
+
+alluvial_df <- hmm_data |>
+  filter(time %in% CHECKPOINT_DAYS) |>
+  select(ID, time, state) |>
+  mutate(time_lbl = factor(paste0("Day ", time),
+                           levels = paste0("Day ", CHECKPOINT_DAYS)))
+
+# Counts of (Day0, Day7, Day14) trajectories
+alluvial_wide <- alluvial_df |>
+  select(-time) |>
+  pivot_wider(names_from = time_lbl, values_from = state) |>
+  count(`Day 0`, `Day 7`, `Day 14`, name = "Freq")
+
+ggplot(
+  alluvial_wide,
+  aes(axis1 = `Day 0`, axis2 = `Day 7`, axis3 = `Day 14`, y = Freq)
+) +
+  geom_alluvium(aes(fill = `Day 0`), alpha = 0.7, width = 1/6) +
+  geom_stratum(width = 1/6, fill = "grey90", colour = "grey40") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = paste0("Day ", CHECKPOINT_DAYS), expand = c(0.05, 0.05)) +
+  scale_fill_manual(values = state_colours, name = "Initial state") +
+  labs(title = "State trajectories — alluvial diagram",
+       subtitle = paste0("Checkpoints: days ",
+                         paste(CHECKPOINT_DAYS, collapse = ", "),
+                         ". Strip width \u221d patient count."),
+       x = NULL, y = "Number of patients") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        plot.title      = element_text(face = "bold"))
+```
+
+```{r save-fig-alluvial, echo=FALSE}
+save_fig(ggplot2::last_plot(), "fig19_final_alluvial_state_sequences",
+         width = 10, height = 6)
+```
+
+---
+
+# 11. Uncertainty quantification (final model)
+
+`hmm$confint()$coeff_fe` is necessary but not sufficient on its own. It
+returns intervals for the fixed-effect coefficients $\alpha$ on the
+**working (link) scale**, from `TMB::sdreport()`. Three consequences:
+
+* For the state-dependent **means** the link is the identity and the model is
+  covariate-free, so the intercept interval *is* the interval for
+  $\mu_{j}$ — on the z-score scale. It still has to be pushed through the
+  z-score and `log1p` back-transform to be reported in clinical units.
+  Both maps are monotone, so the endpoints transform directly.
+* For the **standard deviations** (log link) and the **correlations**
+  (tanh-type link) the same monotone-endpoint argument applies.
+* For the **transition probabilities** it does not. What `coeff_fe$hid`
+  contains is the multinomial-logit coefficients $\eta_{jk}$, and
+  $\gamma_{jk} = e^{\eta_{jk}} / (1 + \sum_{l \neq j} e^{\eta_{jl}})$ depends
+  on the whole row. A marginal interval for $\eta_{jk}$ is therefore *not* an
+  interval for $\gamma_{jk}$: the transformation is neither monotone in a
+  single coefficient nor free of the others. The same applies to everything
+  derived from $\boldsymbol{\Gamma}$, in particular the stationary
+  distribution $\boldsymbol{\pi}$, which Section 7.4 reports as a point
+  estimate only.
+
+hmmTMB solves this with `HMM$predict(what, n_post = ...)`, which draws from
+the approximate distribution of the parameters and returns intervals for the
+quantity itself: `"obspar"`, `"tpm"` and `"delta"` (the stationary
+distribution). Both are reported below: the raw coefficients for
+completeness, and the interpretable-scale intervals for the thesis tables.
+
+```{r uq-config}
+N_POST <- 1000     # posterior draws used for the interpretable-scale intervals
+```
+
+## 11.1 Working-scale coefficients
+
+```{r uq-coeff-fe}
+ci_fe <- tryCatch(hmm$confint(), error = function(e) {
+  warning("hmm$confint() failed: ", conditionMessage(e)); NULL })
+
+if (!is.null(ci_fe)) {
+  fe_obs <- as.data.frame(ci_fe$coeff_fe$obs) |> tibble::rownames_to_column("parameter")
+  fe_hid <- as.data.frame(ci_fe$coeff_fe$hid) |> tibble::rownames_to_column("parameter")
+  save_tab(fe_obs, "tab09_uq_coeff_fe_obs",
+           caption = "Observation-model fixed effects, working (link) scale, with 95% Wald intervals.")
+  save_tab(fe_hid, "tab10_uq_coeff_fe_hid",
+           caption = paste0("Hidden-process fixed effects: multinomial-logit ",
+                            "coefficients eta_jk, working scale. These are NOT ",
+                            "intervals for gamma_jk; see Section 11.2."))
+}
+```
+
+## 11.2 Intervals on the interpretable scale
+
+```{r uq-predict}
+# hmmTMB has returned the point estimate under either `mle` or `mean`
+# depending on version; accept both, and fail loudly if neither is there.
+pick <- function(x, nm = "mean") {
+  if (!is.list(x))
+    stop("hmm$predict() returned an array, not a list: n_post was ignored.")
+  v <- x[[nm]]
+  if (is.null(v)) v <- x[["mle"]]
+  if (is.null(v)) stop("No point estimate found in hmm$predict() output; ",
+                       "names are: ", paste(names(x), collapse = ", "))
+  v
+}
+
+# t = 1 is essential. Without it, and with no newdata, hmmTMB predicts at
+# every row of the data set: with N_POST draws that is nrow(hmm_data) x N_POST
+# evaluations and an array that will not fit in memory. The model is
+# covariate-free, so all time points carry identical parameters and t = 1 is
+# not an approximation.
+# The draws are random: seeding them is what makes the reported intervals
+# reproducible across knits.
+safe_predict <- function(what) {
+  tryCatch({
+    set.seed(SEED)
+    hmm$predict(what, t = 1, n_post = N_POST)
+  }, error = function(e) {
+    warning("hmm$predict(\"", what, "\", t = 1, n_post = ", N_POST,
+            ") failed: ", conditionMessage(e))
+    NULL
+  })
+}
+
+pred_obs <- safe_predict("obspar")
+pred_tpm <- safe_predict("tpm")
+pred_del <- safe_predict("delta")
+
+cat("predict('obspar') returned : ",
+    if (is.null(pred_obs)) "FAILED" else paste(names(pred_obs), collapse = ", "), "\n",
+    "predict('tpm')    returned : ",
+    if (is.null(pred_tpm)) "FAILED" else paste(names(pred_tpm), collapse = ", "), "\n",
+    "predict('delta')  returned : ",
+    if (is.null(pred_del)) "FAILED" else paste(names(pred_del), collapse = ", "), "\n",
+    sep = "")
+
+if (is.null(pred_obs) || is.null(pred_tpm))
+  warning("Section 11.2 could not be computed. Do NOT report Sections 3.5/3.6 ",
+          "of the chapter with intervals until this is fixed.")
+```
+
+### State-dependent parameters, clinical units
+
+```{r uq-obspar}
+if (!is.null(pred_obs)) {
+  cat("predict('obspar') components:\n")
+  for (nm in names(pred_obs))
+    cat("  ", nm, ": dim = ",
+        paste(dim(pred_obs[[nm]]) %||% length(pred_obs[[nm]]), collapse = " x "),
+        "\n", sep = "")
+
+  uq_done <- tryCatch({
+
+    canon <- rownames(hmm$par()$obspar[, , 1])   # z.mu1, z.sd1, z.corr12, ...
+
+    # Coerce whatever predict() returned into a [parameter x state] matrix,
+    # tolerating 2-d or 3-d layouts, a transposed layout, and missing dimnames.
+    to_mat <- function(a, nm) {
+      if (is.null(a)) stop("component '", nm, "' is missing")
+      d <- dim(a)
+      m <- if (is.null(d))            matrix(as.numeric(a), nrow = length(a))
+           else if (length(d) == 2)   unclass(as.matrix(a))
+           else if (length(d) == 3)   a[, , 1]
+           else stop("component '", nm, "' has ", length(d), " dimensions")
+      m <- as.matrix(m)
+      if (nrow(m) == N_STATES && ncol(m) == length(canon)) m <- t(m)
+      if (ncol(m) != N_STATES || nrow(m) != length(canon))
+        stop("component '", nm, "' is ", nrow(m), "x", ncol(m),
+             ", expected ", length(canon), "x", N_STATES)
+      rownames(m) <- canon
+      m <- m[, state_remap_inv, drop = FALSE]
+      colnames(m) <- state_levels
+      m
+    }
+
+    tidy <- function(m, value_name)
+      tibble::as_tibble(m, rownames = "parameter") |>
+        tidyr::pivot_longer(-parameter, names_to = "state", values_to = value_name)
+
+    uq_all <- tidy(to_mat(pick(pred_obs), "estimate"), "est") |>
+      dplyr::left_join(tidy(to_mat(pred_obs$lcl, "lcl"), "lcl"),
+                       by = c("parameter", "state")) |>
+      dplyr::left_join(tidy(to_mat(pred_obs$ucl, "ucl"), "ucl"),
+                       by = c("parameter", "state")) |>
+      dplyr::mutate(state = factor(state, levels = state_levels))
+
+    # ---- means and standard deviations, clinical units ----------------------
+    uq_obs <- purrr::map_dfr(seq_along(RESPONSE_VARS_SAFE), function(i) {
+      bsafe <- RESPONSE_VARS_SAFE[i]
+      mu <- dplyr::filter(uq_all, parameter == paste0("z.mu", i))
+      sd <- dplyr::filter(uq_all, parameter == paste0("z.sd", i))
+      mu <- dplyr::arrange(mu, state); sd <- dplyr::arrange(sd, state)
+      tibble::tibble(
+        biomarker = RESPONSE_VARS[i],
+        state     = mu$state,
+        mean      = to_clinical(mu$est, bsafe),
+        mean_lcl  = to_clinical(mu$lcl, bsafe),
+        mean_ucl  = to_clinical(mu$ucl, bsafe),
+        sd        = to_clinical_sd(sd$est, bsafe, mu_logscale = mu$est),
+        sd_lcl    = to_clinical_sd(sd$lcl, bsafe, mu_logscale = mu$est),
+        sd_ucl    = to_clinical_sd(sd$ucl, bsafe, mu_logscale = mu$est))
+    })
+
+    save_tab(uq_obs, "tab11_uq_state_parameters_clinical",
+             caption = paste0("Final model: state-dependent means and standard ",
+                              "deviations in clinical units, with 95% intervals from ",
+                              N_POST, " posterior draws. Endpoints are transformed ",
+                              "individually, which is valid because both maps are ",
+                              "monotone; the sd interval holds the mean at its point ",
+                              "estimate and is therefore conditional on mu-hat."))
+
+    # ---- correlations -------------------------------------------------------
+    p_resp <- length(RESPONSE_VARS_SAFE)
+    if (p_resp >= 2) {
+      idx <- which(upper.tri(matrix(0, p_resp, p_resp)), arr.ind = TRUE)
+      uq_corr <- purrr::map_dfr(seq_len(nrow(idx)), function(r) {
+        a <- idx[r, 1]; b <- idx[r, 2]
+        rn <- paste0("z.corr", a, b)
+        d  <- dplyr::filter(uq_all, parameter == rn)
+        if (nrow(d) == 0) return(NULL)
+        tibble::tibble(
+          pair  = paste(RESPONSE_VARS[a], RESPONSE_VARS[b], sep = " - "),
+          state = d$state, rho = d$est, lcl = d$lcl, ucl = d$ucl,
+          excludes_zero = sign(d$lcl) == sign(d$ucl))
+      })
+      if (!is.null(uq_corr) && nrow(uq_corr) > 0) {
+        save_tab(uq_corr, "tab11b_uq_state_correlations", digits = 4,
+                 caption = paste0("Final model: state-dependent correlations with ",
+                                  "95% intervals from ", N_POST, " posterior draws."))
+        cat("\nCorrelations whose interval excludes zero: ",
+            sum(uq_corr$excludes_zero), " of ", nrow(uq_corr), "\n", sep = "")
+      } else {
+        warning("predict('obspar') returned no correlation rows.")
+      }
+    }
+
+    # ---- figure -------------------------------------------------------------
+    p_uq_mu <- ggplot(uq_obs, aes(mean, state, colour = state)) +
+      geom_errorbarh(aes(xmin = mean_lcl, xmax = mean_ucl), height = 0.18) +
+      geom_point(size = 2.4) +
+      facet_wrap(~ biomarker, scales = "free_x") +
+      scale_colour_manual(values = state_colours, guide = "none") +
+      labs(title = "State-dependent means with 95% intervals",
+           subtitle = "Clinical units; final model", x = NULL, y = NULL)
+    print(p_uq_mu)
+    save_fig(p_uq_mu, "fig20_uq_state_means", width = 10, height = 4)
+    TRUE
+  }, error = function(e) {
+    warning("Section 11.2 (obspar) failed: ", conditionMessage(e),
+            " -- tab11/tab11b/fig20 not produced.")
+    FALSE
+  })
+}
+```
+
+### Transition probabilities and stationary distribution
+
+```{r uq-tpm}
+uq_tpm_done <- tryCatch({
+  if (is.null(pred_tpm)) stop("predict('tpm') returned nothing")
+
+  grab <- function(a, nm) {
+    if (is.null(a)) stop("component '", nm, "' is missing")
+    d <- dim(a)
+    m <- if (length(d) == 3) a[, , 1] else as.matrix(a)
+    if (!identical(dim(m), c(as.integer(N_STATES), as.integer(N_STATES))))
+      stop("component '", nm, "' is ", paste(dim(m), collapse = "x"),
+           ", expected ", N_STATES, "x", N_STATES)
+    m[state_remap_inv, state_remap_inv, drop = FALSE]
+  }
+  g_est <- grab(pick(pred_tpm), "estimate")
+  g_lcl <- grab(pred_tpm$lcl, "lcl")
+  g_ucl <- grab(pred_tpm$ucl, "ucl")
+
+  uq_tpm <- purrr::map_dfr(seq_along(state_levels), function(j)
+    tibble::tibble(from = state_levels[j], to = state_levels,
+                   gamma = g_est[j, ], lcl = g_lcl[j, ], ucl = g_ucl[j, ]))
+  save_tab(uq_tpm, "tab12_uq_transition_probabilities", digits = 4,
+           caption = paste0("Final model: transition probabilities with 95% ",
+                            "intervals from ", N_POST, " posterior draws."))
+
+  uq_dwell <- tibble::tibble(
+    state      = state_levels,
+    gamma_jj   = diag(g_est),
+    dwell_days = 1 / (1 - diag(g_est)),
+    dwell_lcl  = 1 / (1 - diag(g_lcl)),
+    dwell_ucl  = 1 / (1 - diag(g_ucl)))
+  save_tab(uq_dwell, "tab13_uq_expected_dwell_times", digits = 3,
+           caption = paste0("Final model: expected dwell times in days, with the ",
+                            "intervals induced by those on gamma_jj. Compare with ",
+                            "the ", dplyr::n_distinct(hmm_data$time),
+                            "-day observation window."))
+  TRUE
+}, error = function(e) {
+  warning("Section 11.2 (tpm) failed: ", conditionMessage(e),
+          " -- tab12/tab13 not produced."); FALSE
+})
+
+uq_delta_done <- tryCatch({
+  if (is.null(pred_del)) stop("predict('delta') returned nothing")
+  first_col <- function(a, nm) {
+    if (is.null(a)) stop("component '", nm, "' is missing")
+    v <- if (is.null(dim(a))) as.numeric(a) else {
+      m <- as.matrix(a)
+      if (nrow(m) == N_STATES) as.numeric(m[, 1])
+      else if (ncol(m) == N_STATES) as.numeric(m[1, ])
+      else stop("component '", nm, "' has no margin of length ", N_STATES)
+    }
+    v[seq_len(N_STATES)]
+  }
+  d_est <- first_col(pick(pred_del), "estimate")[state_remap_inv]
+  d_lcl <- first_col(pred_del$lcl, "lcl")[state_remap_inv]
+  d_ucl <- first_col(pred_del$ucl, "ucl")[state_remap_inv]
+
+  if (exists("pi_stat")) {
+    disc <- max(abs(d_est - as.numeric(pi_stat)))
+    cat("Max |predict('delta') - Section 7.4 pi| = ", signif(disc, 3), "\n", sep = "")
+    if (disc > 1e-3)
+      warning("predict('delta') disagrees with Section 7.4; one is mis-permuted.")
+  }
+
+  uq_delta <- tibble::tibble(state = state_levels, pi = d_est,
+                             lcl = d_lcl, ucl = d_ucl)
+  save_tab(uq_delta, "tab14_uq_stationary_distribution", digits = 4,
+           caption = "Final model: stationary distribution with 95% intervals.")
+
+  p_uq_pi <- uq_delta |>
+    dplyr::mutate(state = factor(state, levels = state_levels)) |>
+    ggplot(aes(state, pi, fill = state)) +
+    geom_col(width = 0.6, show.legend = FALSE) +
+    geom_errorbar(aes(ymin = lcl, ymax = ucl), width = 0.15) +
+    scale_fill_manual(values = state_colours) +
+    labs(title = "Stationary distribution with 95% intervals",
+         x = NULL, y = "Probability")
+  print(p_uq_pi)
+  save_fig(p_uq_pi, "fig21_uq_stationary_distribution", width = 7, height = 4.5)
+  TRUE
+}, error = function(e) {
+  warning("Section 11.2 (delta) failed: ", conditionMessage(e),
+          " -- tab14/fig21 not produced."); FALSE
+})
+```
+
+> **What kind of intervals these are.** Both `confint()` and the draws behind
+> `predict(n_post = )` come from the same source: the normal approximation to
+> the distribution of the fixed-effect parameters produced by
+> `TMB::sdreport()`. They are Wald-type, not bootstrap, and they inherit the
+> caveat that the hmmTMB authors state for the Laplace approximation, namely
+> that it can behave poorly when the likelihood is multimodal or markedly
+> asymmetric. Section 5.1 is the relevant check: if the restarts all reach
+> the same maximum, the approximation is on safer ground. Report the
+> intervals as asymptotic.
+>
+> **Still open.** The intervals above are conditional on the fitted model:
+> they quantify parameter uncertainty, not uncertainty from the choice of
+> $K$, from the response set, or from the fact that the observations are
+> GAM-smoothed trajectories rather than measurements. If you also want
+> decoding uncertainty (the entropy of the smoothed state probabilities, or
+> the share of patient-days whose maximum posterior probability falls below a
+> threshold) or a patient-level bootstrap, say so and I will add it; neither
+> is implemented here.
+
+---
+
+# 12. Export fitted objects for post-hoc analysis
+
+`hmm_posthoc.Rmd` reuses these objects without refitting. The bundle keeps
+the previous schema so the post-hoc notebook does not need editing, with two
+changes: there is no held-out set any more, and the provenance of the model
+selection is recorded alongside the fit.
+
+```{r export-objects}
+posthoc_bundle <- list(
+  # Fitted model + working data
+  hmm        = hmm,
+  hmm_data   = hmm_data,                 # all rows, with Viterbi states
+  test_data  = NULL,                     # no hold-out in this design
+  df_full    = df,                       # safe-renamed columns + covariates
+  # Split indices (kept for schema compatibility)
+  train_ids  = levels(hmm_data$ID),
+  test_ids   = character(0),
+  # Configuration
+  config     = list(
+    RESPONSE_VARS        = RESPONSE_VARS,
+    RESPONSE_VARS_SAFE   = RESPONSE_VARS_SAFE,
+    OBS_COVARIATES       = OBS_COVARIATES,
+    OBS_COVARIATES_SAFE  = OBS_COVARIATES_SAFE,
+    COVARIATE_TERMS      = if (exists("COVARIATE_TERMS")) COVARIATE_TERMS else NULL,
+    SPLINE_K_DEFAULT     = if (exists("SPLINE_K_DEFAULT")) SPLINE_K_DEFAULT else NULL,
+    SPLINE_BS            = if (exists("SPLINE_BS")) SPLINE_BS else NULL,
+    N_STATES             = N_STATES,
+    APPLY_ZSCORE         = APPLY_ZSCORE,
+    IS_a_MVN             = IS_a_MVN,
+    SEED                 = SEED,
+    TEST_FRAC            = TEST_FRAC,
+    DATA_PATH            = DATA_PATH,
+    BM_LOG1P_DECISIONS_PATH = BM_LOG1P_DECISIONS_PATH,
+    CATEGORICAL_COVS     = CATEGORICAL_COVS,
+    STATE_LABELS_MAP        = if (exists("STATE_LABELS_MAP"))     STATE_LABELS_MAP     else NULL,
+    STATE_DISPLAY_ORDER     = if (exists("STATE_DISPLAY_ORDER"))  STATE_DISPLAY_ORDER  else NULL,
+    STATE_PALETTE_CUSTOM    = if (exists("STATE_PALETTE_CUSTOM")) STATE_PALETTE_CUSTOM else NULL,
+    USE_CUSTOM_STATE_LABELS = USE_CUSTOM_STATE_LABELS
+  ),
+  # Provenance of the model-selection stages (summaries only; the candidate
+  # fits themselves are deliberately not carried forward)
+  selection  = list(
+    axis_stems          = AXIS_STEMS,
+    axis_under_test     = AXIS_UNDER_TEST,
+    K_axis_test         = K_AXIS_TEST,
+    K_grid              = K_GRID,
+    K_final             = N_STATES,
+    ovl_drop_threshold  = OVL_DROP_THRESHOLD,
+    min_state_share_pct = MIN_STATE_SHARE_PCT,
+    stage1_metrics      = stage1_metrics,
+    stage1_overlap      = stage1_overlap,
+    stage2_criteria     = stage2_criteria,
+    stage2_overlap      = stage2_overlap,
+    stage2_occupancy    = stage2_occupancy,
+    spec_cohort_file    = SPEC_DATA_PATH,
+    final_cohort_file   = DATA_PATH
+  ),
+  # Name mapping
+  name_map   = list(
+    display_to_safe = display_to_safe,
+    safe_to_display = safe_to_display
+  ),
+  # State decoding output
+  patient_states = patient_states,
+  # Back-transform metadata
+  needs_expm1    = needs_expm1,
+  zscore_params  = zscore_params,
+  # Clinical state remap artefacts
+  state_remap     = state_remap,
+  state_remap_inv = state_remap_inv,
+  state_levels    = state_levels,
+  state_colours   = state_colours,
+  state_palette   = unname(state_colours)
+)
+
+saveRDS(posthoc_bundle, file = "hmm_fit_objects_tesi4.rds")
+cat("Saved fitted-model bundle to hmm_fit_objects_tesi4.rds\n")
+cat("Object size on disk: ",
+    round(file.info("hmm_fit_objects_tesi4.rds")$size / 1024^2, 2), " MB\n", sep = "")
+```
+
+## 12.1 Manifest of generated artefacts
+
+```{r artefact-manifest}
+arte <- tibble::tibble(file = list.files(FIG_DIR, full.names = TRUE)) |>
+  dplyr::mutate(kb = round(file.info(file)$size / 1024, 1)) |>
+  dplyr::arrange(file)
+print(knitr::kable(arte, caption = "Figures and tables written by this run."))
+```

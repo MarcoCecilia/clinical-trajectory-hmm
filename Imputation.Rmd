@@ -1,0 +1,1616 @@
+---
+title: "Longitudinal Biomarker Imputation via GAM Gamma"
+author: "Marco Cecilia"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_width: 14
+    fig_height: 7
+    keep_tex: false
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    df_print: paged
+    theme: flatly
+geometry: "a4paper, landscape, margin=1.5cm"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 14,
+  fig.height = 7,
+  out.width  = "100%"
+)
+ggplot2::theme_set(ggplot2::theme_bw())
+```
+
+```{r biomarker-selection}
+# ══════════════════════════════════════════════════════════════════════════════
+# BIOMARKERS_TO_USE — whitelist of biomarkers used for filtering and imputation.
+#
+# Why this exists:
+#   The patient-exclusion criterion ("any biomarker with < 3 valid obs is fatal")
+#   penalises a patient if EVEN ONE biomarker in the input file is sparse.
+#   When a downstream analysis only needs a small subset of biomarkers, this
+#   throws away patients who are perfectly fine for that subset. Setting
+#   BIOMARKERS_TO_USE limits the pipeline to the biomarkers actually needed,
+#   so feasibility / exclusion / imputation / plots all act only on those.
+#
+# Usage:
+#   * NULL         → use every biomarker found in the CSV (default behaviour)
+#   * c("...","..") → use only the listed biomarkers; everything else is
+#                     dropped from the df at load time and never seen again.
+#
+# Names must match the CSV column headers exactly (units included), e.g.
+# "HGB (g/dL)", "PLT (10^9/L)", "CRP (mg/L)".
+# ══════════════════════════════════════════════════════════════════════════════
+
+#BIOMARKERS_TO_USE <- NULL    # ← edit this: NULL = all, or a character vector
+# Example for a downstream analysis using only 4 biomarkers:
+# NOTE: CRP and WBC are included because the CRP-WBC discordance channel D(t)
+# is derived from them (see the 'add-discordance-channel' chunk further down).
+# Their presence tightens the "<3 valid obs is fatal" exclusion slightly — drop
+# them (and set INFECTION_ADD_D <- FALSE below) if you don't want D(t).
+BIOMARKERS_TO_USE <- c("HGB (g/dL)", "CREA (mg/dL)", "ALT (U/L)")
+```
+
+\newpage
+
+# Setup and Data Loading
+
+We load the longitudinal dataset of repeated blood biomarker measurements for
+hospitalised patients. Each row is one blood draw for one patient, indexed by
+`day` (days since admission, starting at 0). Static admission-level covariates
+are preserved in the output.
+
+```{r libraries}
+library(tidyverse)
+library(splines)
+library(patchwork)
+library(mgcv)       # GAM with Gamma family + log link for skewed biomarkers
+```
+
+```{r load-data}
+df <- read_csv("df_longitudinal.csv")
+
+# ── Drop columns we don't want anywhere downstream ────────────────────────────
+# - days_in_ER_capped : redundant with days_in_ER
+# - ward_start_date   : not needed for imputation/clustering
+# - solid_tumor       : kept solid_tumor_category instead (richer)
+df <- df %>% select(-any_of(c("days_in_ER_capped",
+                              "ward_start_date",
+                              "solid_tumor")))
+
+# ── Derive survival-related variables from the date columns ─────────────────
+# All static patient-level except is_dead, which varies per day and is built
+# downstream after the per-day grid is assembled (see df_main chunk). All are
+# computed once here / there and then carried along like every other covariate.
+# None of them are predictors of biomarkers and none are imputed.
+#
+# ──── INVARIANT: date_of_death is the SOURCE OF TRUTH ────────────────────
+# All other death-related columns (discharged_alive, discharge_mortality_90d,
+# days_death_from_admission, days_death_from_discharge, is_dead) MUST be
+# consistent with date_of_death (and admission_end_date) as derived here.
+# When the clinical registry's discharged_alive disagrees with what
+# date_of_death implies, we OVERRIDE discharged_alive to match date_of_death.
+# Specifically:
+#   - date_of_death IS NA           → discharged_alive := 1 (alive)
+#   - date_of_death <= adm_end_date → discharged_alive := 0 (in-hospital)
+#   - date_of_death  > adm_end_date → discharged_alive := 1 (post-discharge death)
+# The "<=" boundary (date_of_death == admission_end_date counts as in-hospital)
+# matches the days_death_from_discharge sentinel rule below, so the two
+# columns are coherent by construction.
+# ─────────────────────────────────────────────────────────────────────────
+#
+#   discharge_mortality_90d : 1 if patient died within 90 days of discharge
+#                             (date_of_death - admission_end_date <= 90),
+#                             0 otherwise (incl. patients still alive).
+#   days_death_from_admission : days from admission start to death, as integer.
+#                               -1 sentinel when the patient is still alive
+#                               (date_of_death is NA).
+#   days_death_from_discharge : days from discharge (admission_end_date) to
+#                               death, as integer. Designed for post-discharge
+#                               survival analysis, so the two non-event groups
+#                               are kept on DISTINCT sentinel values:
+#                                 -1  → patient still alive at end of follow-up
+#                                       (date_of_death is NA). Censored.
+#                                 -2  → patient died IN-HOSPITAL, i.e.
+#                                       date_of_death <= admission_end_date
+#                                       (diff <= 0). Excluded from a
+#                                       post-discharge survival analysis.
+#                                 >=1 → days from discharge to death, as a
+#                                       positive integer. Event observed.
+#                               Rationale for two sentinels: a single -1 for
+#                               both alive and in-hospital-dead would force
+#                               downstream code to recompute the in-hospital
+#                               check from date_of_death every time. Keeping
+#                               them separate makes filters trivial
+#                               (e.g. `filter(days_death_from_discharge != -2)`
+#                               to drop in-hospital deaths).
+#   is_dead (per-day, added in df_main) : 1 from the day of death onwards, 0
+#                               before. Always 0 for living patients.
+#
+# Manual data correction: patient c7663d22-d910-c301-bfde-3a1d24fc8362 has a
+# recorded date_of_death that is known to be incorrect per domain expert. Set
+# it to NA so the patient is treated as alive at end of follow-up.
+#
+# Defensive: parse dates to Date so arithmetic works even if read_csv left
+# them as character (depends on whether the source CSV had ISO format).
+df <- df %>%
+  mutate(
+    admission_start_date = suppressWarnings(as.Date(admission_start_date)),
+    admission_end_date   = suppressWarnings(as.Date(admission_end_date)),
+    date_of_death        = suppressWarnings(as.Date(date_of_death)),
+    date_of_death = if_else(
+      patient_id == "c7663d22-d910-c301-bfde-3a1d24fc8362",
+      as.Date(NA), date_of_death
+    ),
+    .death_minus_end   = as.integer(date_of_death - admission_end_date),
+    .death_minus_start = as.integer(date_of_death - admission_start_date),
+    # ── Reconcile discharged_alive against date_of_death (invariant above) ──
+    # Stash the original so we can audit how many corrections were applied.
+    .discharged_alive_original = discharged_alive,
+    discharged_alive = case_when(
+      is.na(date_of_death)      ~ 1L,   # no recorded death → alive
+      .death_minus_end <= 0L    ~ 0L,   # died on or before discharge → in-hosp
+      TRUE                      ~ 1L    # died strictly after discharge → alive
+    ),
+    discharge_mortality_90d = if_else(
+      !is.na(date_of_death) & .death_minus_end <= 90, 1L, 0L
+    ),
+    days_death_from_admission = if_else(
+      is.na(date_of_death), -1L, .death_minus_start
+    ),
+    days_death_from_discharge = case_when(
+      is.na(date_of_death)    ~ -1L,   # still alive at follow-up
+      .death_minus_end <= 0L  ~ -2L,   # died in-hospital
+      TRUE                    ~ .death_minus_end
+    )
+  )
+
+# ── Reconciliation audit ─────────────────────────────────────────────────
+# Report (one line per patient) any case where the registry's discharged_alive
+# disagreed with what date_of_death implies. This is patient-level, not per-day.
+.reconciled <- df %>%
+  distinct(patient_id, .keep_all = TRUE) %>%
+  filter(.discharged_alive_original != discharged_alive |
+         (is.na(.discharged_alive_original) & !is.na(discharged_alive))) %>%
+  select(patient_id, admission_start_date, admission_end_date,
+         date_of_death,
+         discharged_alive_was   = .discharged_alive_original,
+         discharged_alive_now   = discharged_alive)
+
+cat("── discharged_alive reconciliation ───────────────────────────────────\n")
+cat(sprintf("Patients whose discharged_alive was overridden to match date_of_death: %d\n",
+            nrow(.reconciled)))
+if (nrow(.reconciled) > 0) {
+  cat("Detail (one row per patient):\n")
+  print(.reconciled, n = Inf)
+}
+cat("\n")
+
+df <- df %>%
+  select(-.death_minus_end, -.death_minus_start, -.discharged_alive_original)
+
+# ── Covariate set (admission-level statics, replicated across days) ──────────
+# Updated to match the columns produced by the Python pipeline, minus the 3
+# dropped above, plus the 2 derived survival variables.
+cov_cols <- c(
+  # Admission window
+  "admission_start_date", "admission_end_date",
+  # Demographics & lifestyle
+  "sex", "hospital_ward", "age", "pack_years_smoking", "alcohol_years",
+  # Stay characteristics
+  "length_of_stay_days", "days_in_ER", "ER_last_day",
+  # Prior-admission burden
+  "admissions_last_12m", "admissions_last_6m",
+  # Functional / clinical scores
+  "ECOG", "Barthel_index", "Braden_score", "CIRS_total_score",
+  # Admission / discharge
+  "admission_reason", "discharged_alive", "discharge_mode",
+  # Tumor info
+  "solid_tumor_category",
+  # Death info
+  "date_of_death",
+  # Derived survival outcomes (computed above)
+  "discharge_mortality_90d", "days_death_from_admission",
+  "days_death_from_discharge"
+)
+id_cols  <- c("patient_id", "analysis_date", "day")
+bio_cols <- setdiff(names(df), c(id_cols, cov_cols))
+
+# ── Apply BIOMARKERS_TO_USE whitelist (set in the biomarker-selection chunk) ──
+# If non-NULL, restrict the pipeline to only the listed biomarkers. Everything
+# downstream (exclusion, feasibility, imputation, plots, output) inherits this
+# automatically because they all derive from bio_cols.
+if (!is.null(BIOMARKERS_TO_USE)) {
+  missing_in_csv <- setdiff(BIOMARKERS_TO_USE, bio_cols)
+  if (length(missing_in_csv) > 0) {
+    stop("BIOMARKERS_TO_USE contains names not found in the CSV: ",
+         paste(missing_in_csv, collapse = ", "),
+         "\nAvailable biomarkers: ", paste(bio_cols, collapse = ", "))
+  }
+  dropped <- setdiff(bio_cols, BIOMARKERS_TO_USE)
+  df       <- df %>% select(-all_of(dropped))
+  bio_cols <- BIOMARKERS_TO_USE
+  cat("── BIOMARKERS_TO_USE active ─────────────────────────────────────────\n")
+  cat("  Kept    :", length(bio_cols), "biomarkers\n")
+  cat("  Dropped :", length(dropped),  "biomarkers from CSV\n")
+} else {
+  cat("BIOMARKERS_TO_USE is NULL → using all", length(bio_cols),
+      "biomarkers from the CSV\n")
+}
+
+cat("Total rows:     ", nrow(df), "\n")
+cat("Total patients: ", n_distinct(df$patient_id), "\n")
+cat("Covariates:     ", length(cov_cols), "\n")
+cat("Biomarkers:     ", length(bio_cols), "\n")
+```
+
+```{r admission-covariates}
+admission_covs <- df %>%
+  select(patient_id, all_of(cov_cols)) %>%
+  distinct(patient_id, .keep_all = TRUE)
+```
+
+```{r nan-percent-per-biomarker}
+# ── NaN % per biomarker on the raw longitudinal table ────────────────────────
+# Reported BEFORE patient exclusion so the reader sees the missingness pattern
+# of the input, not what's left after filtering.
+bio_nan_summary <- df %>%
+  summarise(across(all_of(bio_cols),
+                   list(n_obs = ~ length(.x),
+                        n_nan = ~ sum(is.na(.x))),
+                   .names = "{.col}__{.fn}")) %>%
+  pivot_longer(everything(),
+               names_to = c("biomarker", ".value"),
+               names_sep = "__") %>%
+  mutate(pct_nan = round(100 * n_nan / n_obs, 2)) %>%
+  arrange(desc(pct_nan))
+
+cat("── NaN % per biomarker (raw longitudinal table) ──────────────────────\n")
+print(bio_nan_summary, n = length(bio_cols))
+```
+
+\newpage
+
+# Patient Exclusion
+
+**Two criteria are applied (union, i.e. failing either triggers exclusion):**
+
+- **Day range < 5**: the observation window is too narrow for any meaningful
+  spline trajectory.
+- **Any biomarker with < 3 valid observations**: if even a single biomarker
+  has fewer than 3 non-missing values for a patient, reliable imputation is
+  impossible for that combination and the patient is excluded entirely.
+  This replaces the previous global `n_obs < 5` criterion, which did not
+  catch the case of a patient with many total draws but some biomarkers
+  completely empty.
+
+```{r exclusion}
+MIN_RANGE   <- 5L   # minimum day range (day_max - 0)
+MIN_OBS_BIO <- 3L   # minimum valid obs per patient × biomarker
+
+# ── Per-patient day-range summary ──────────────────────────────────────────────
+day_summary <- df %>%
+  group_by(patient_id) %>%
+  summarise(
+    day_min   = 0L,
+    day_max   = max(day),
+    day_range = day_max - day_min,
+    n_obs     = n(),
+    .groups   = "drop"
+  )
+
+# ── Per patient × biomarker: count valid observations ─────────────────────────
+bio_valid_counts <- df %>%
+  pivot_longer(cols = all_of(bio_cols),
+               names_to = "biomarker", values_to = "value") %>%
+  group_by(patient_id, biomarker) %>%
+  summarise(n_valid = sum(!is.na(value)), .groups = "drop")
+
+# Patients where the worst biomarker has < MIN_OBS_BIO valid values
+sparse_patients <- bio_valid_counts %>%
+  group_by(patient_id) %>%
+  summarise(min_n_valid_across_bm = min(n_valid), .groups = "drop") %>%
+  filter(min_n_valid_across_bm < MIN_OBS_BIO) %>%
+  pull(patient_id)
+
+# Patients with too narrow a day range
+narrow_patients <- day_summary %>%
+  filter(day_range < MIN_RANGE) %>%
+  pull(patient_id)
+
+# Union of both criteria
+excluded_ids <- union(narrow_patients, sparse_patients)
+eligible_ids <- setdiff(day_summary$patient_id, excluded_ids)
+df_clean     <- df %>% filter(patient_id %in% eligible_ids)
+
+# ── Exclusion breakdown ────────────────────────────────────────────────────────
+excl_only_narrow <- setdiff(narrow_patients, sparse_patients)
+excl_only_sparse <- setdiff(sparse_patients, narrow_patients)
+excl_both        <- intersect(narrow_patients, sparse_patients)
+
+cat("═══════════════════════════════════════════════════\n")
+cat("              EXCLUSION SUMMARY\n")
+cat("═══════════════════════════════════════════════════\n")
+cat(sprintf("Original patients:                        %d\n",
+            n_distinct(df$patient_id)))
+cat(sprintf("Excluded – narrow day range only (<%dd):  %d\n",
+            MIN_RANGE, length(excl_only_narrow)))
+cat(sprintf("Excluded – sparse biomarker only (<%d obs):%d\n",
+            MIN_OBS_BIO, length(excl_only_sparse)))
+cat(sprintf("Excluded – both criteria:                 %d\n",
+            length(excl_both)))
+cat(sprintf("Total excluded:                           %d\n",
+            length(excluded_ids)))
+cat(sprintf("Retained (eligible):                      %d\n",
+            length(eligible_ids)))
+
+# Show which biomarkers drive the sparse exclusions
+bio_valid_counts %>%
+  filter(patient_id %in% sparse_patients) %>%
+  group_by(biomarker) %>%
+  summarise(
+    n_patients_sparse = n_distinct(patient_id),
+    mean_n_valid      = round(mean(n_valid), 1),
+    .groups = "drop"
+  ) %>%
+  filter(n_patients_sparse > 0) %>%
+  arrange(desc(n_patients_sparse)) %>%
+  print(n = 20)
+```
+
+\newpage
+
+
+# Prediction Grid
+
+The grid is fixed at **14 days** (day 0 to day 14, 15 time points). All
+patients and biomarkers are evaluated on this common grid.
+
+```{r grid}
+GRID_MAX  <- 14L
+GRID_DAYS <- 0:GRID_MAX
+cat("Grid: day 0 –", GRID_MAX, "(", length(GRID_DAYS), "points)\n")
+```
+
+\newpage
+
+# Imputation Strategy
+
+
+```{r manually fix some observation that has some physiological implausibility}
+# ── Manual fixes for implausible values ───────────────────────────────────────
+# patient "38f7f49b-6a5a-7717-3792-3a1d2518f66e" has HGB at 0 at day 10 and 16, and RBC at 0 at day 19
+#remove all the observations for this patient in those days
+df_clean <- df_clean %>%
+  filter(!(patient_id == "38f7f49b-6a5a-7717-3792-3a1d2518f66e" &
+           day %in% c(10, 16,19)))
+```
+
+## Pre-fitting data conditioning
+
+Two issues are addressed BEFORE the imputation step, both motivated by the
+fact that natural cubic splines and smoothing splines are unconstrained
+linear smoothers and can produce negative predictions on strictly
+non-negative quantities (which is biologically nonsensical).
+
+### Step 1 — Physiologically implausible zeros → NA
+
+For a small set of haematological parameters, a value of 0 cannot occur in
+a living patient (it would imply absence of red blood cells / haemoglobin)
+and is almost certainly an instrument-read error. We coerce these to `NA`
+so they do not anchor splines toward zero. Variables where 0 is biologically
+plausible (e.g. eosinopenia → EOS = 0) are left untouched.
+
+```{r physiological-zeros}
+# Whitelist of biomarkers where 0 is physiologically impossible.
+# Background: red-cell parameters (HCT, HGB, RBC) and red-cell indices
+# (MCH, MCHC, MCV) are bounded well above zero in any living patient.
+biomarkers_zero_implausible <- c(
+  "HCT (%)", "HGB (g/dL)", "RBC (10^12/L)",
+  "MCH (pg)", "MCHC (g/dL)", "MCV (fL)"
+)
+
+# Restrict to biomarkers actually in scope (BIOMARKERS_TO_USE may have
+# excluded some of these — that's fine, they just don't need recoding).
+biomarkers_zero_implausible <- intersect(biomarkers_zero_implausible, bio_cols)
+
+if (length(biomarkers_zero_implausible) == 0) {
+  cat("── No physiologically-implausible-zero biomarkers in current selection;",
+      "skipping recoding step.\n")
+} else {
+  # Count zeros before, replace with NA, count after
+  n_zeros_before <- df_clean %>%
+    summarise(across(all_of(biomarkers_zero_implausible),
+                     ~ sum(.x == 0, na.rm = TRUE))) %>%
+    pivot_longer(everything(), names_to = "biomarker", values_to = "n_zeros") %>%
+    filter(n_zeros > 0)
+
+  df_clean <- df_clean %>%
+    mutate(across(all_of(biomarkers_zero_implausible),
+                  ~ if_else(.x <= 0, NA_real_, .x)))
+
+  cat("── Implausible zeros recoded as NA ─────────────────────────────────\n")
+  print(n_zeros_before)
+}
+```
+
+### Step 2 — Model choice: GAM with Gamma family and log link
+
+All biomarkers are fitted with the same model: a Generalised Additive
+Model (`mgcv::gam`) with Gamma response distribution and log link, on
+the raw scale. The fit is performed independently for every
+(patient × biomarker) combination.
+
+**Why this single model**:
+
+- **Structural non-negativity**. The log link gives
+  $\hat\mu(t) = \exp(\eta(t)) > 0$ for any real value of the linear
+  predictor $\eta(t)$. The fitted curve cannot dip below zero anywhere
+  on the grid, not just at observed days. This removes the negativity
+  problem that affected the earlier NCS / smoothing-spline approaches,
+  without any post-hoc trick (no truncation, no response transform
+  followed by back-transform).
+- **Native heteroscedasticity**. The Gamma distribution satisfies
+  $\text{Var}(Y) = \phi \mu^2$, i.e. variance scales with the squared
+  mean. This matches the empirical pattern of CRP, LDH, transaminases
+  (higher-mean patients have proportionally larger fluctuations) more
+  faithfully than a homoscedastic Gaussian spline.
+- **No back-transform bias**. The model targets $\mathbb{E}[Y]$ directly
+  through the link; we do not compute $\exp(\mathbb{E}[\log Y])$, which
+  would be biased (Duan 1983).
+- **Single model, single code path**. A uniform choice across
+  biomarkers makes the pipeline easier to reproduce and to document
+  in the thesis.
+
+**Exact zeros**. The Gamma family requires $Y > 0$ strictly. A small
+number of biomarkers (EOS, LYM, MONO, NEU, PLT) can take the exact
+value 0 legitimately (eosinopenia, lymphopenia, etc.). When these zeros
+appear among the observations of a patient × biomarker combination,
+`fit_gam_gamma` replaces them with $0.5 \times \min\{y : y > 0\}$
+computed on that patient's observed values, before fitting. This is
+the standard pragmatic device for Gamma / log-normal models with
+zero observations.
+
+**Basis dimension**. The smoothing-parameter λ is chosen automatically
+by `mgcv` via REML (Wood 2011). The upper bound $k$ on the basis
+dimension is adapted to the effective sample size:
+$k = \min(6, \max(3, \lceil n/2 \rceil))$, where $n$ is the number of
+points seen by the fit (observations plus anchor points). This
+"more data → more knots" heuristic lets the fit capture more complex
+trajectories when the data support it, while remaining stable for
+patients with few measurements.
+
+**Grid invariant**. Predictions are computed on the full
+`GRID_DAYS = 0:14` (15 points) for every combination. The day-0 anchor
+(always) and the day-14 anchor (for short-stay patients) ensure the
+fit is stabilised at the grid boundaries; the penalised spline
+interpolates inside and extrapolates smoothly outside the observed
+range when necessary.
+
+**Fallback**. When a patient × biomarker combination has fewer than
+4 valid observations, the GAM is not fitted; LOCF (Last Observation
+Carried Forward, with NOCB for leading missing days) is used instead.
+LOCF is also used automatically whenever the GAM fit fails to
+converge — an unlikely but possible event on very sparse data.
+
+## Decision rules per patient × biomarker combination
+
+| `n_valid` | `day_max`  | Routine                                  |
+|-----------|------------|------------------------------------------|
+| `< 4`     | any        | **LOCF** (universal fallback)            |
+| `>= 4`    | `>= 14`    | **GAM Gamma** + day-0 anchor             |
+| `>= 4`    | `< 14`     | **GAM Gamma** + day-0 anchor + day-14 anchor |
+
+In all non-LOCF cases, the output is a length-15 vector on the raw
+scale, guaranteed non-negative by construction of the log link.
+
+\newpage
+
+
+```{r feasibility}
+MIN_OBS <- 4L
+
+feasibility <- df_clean %>%
+  pivot_longer(cols = all_of(bio_cols),
+               names_to = "biomarker", values_to = "value") %>%
+  group_by(patient_id, biomarker) %>%
+  summarise(
+    n_valid    = sum(!is.na(value)),
+    day_max_bm = if (any(!is.na(value))) max(day[!is.na(value)]) else 0L,
+    .groups    = "drop"
+  ) %>%
+  mutate(strategy = if_else(n_valid < MIN_OBS, "LOCF", "GAM"))
+
+cat("=== Strategy distribution (patient × biomarker) ===\n")
+feasibility %>%
+  count(strategy) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  print()
+```
+
+```{r locf-plot, fig.height=6, fig.width=14}
+locf_by_bm <- feasibility %>%
+  filter(strategy == "LOCF") %>%
+  count(biomarker, name = "n_LOCF") %>%
+  mutate(pct = round(100 * n_LOCF / length(eligible_ids), 1)) %>%
+  arrange(desc(n_LOCF))
+
+locf_by_pat <- feasibility %>%
+  filter(strategy == "LOCF") %>%
+  count(patient_id, name = "n_LOCF_bm")
+
+p1 <- ggplot(locf_by_bm,
+             aes(x = reorder(biomarker, n_LOCF), y = n_LOCF)) +
+  geom_col(fill = "darkorange", alpha = 0.8) +
+  geom_text(aes(label = paste0(pct, "%")), hjust = -0.1, size = 2.8) +
+  coord_flip(clip = "off") +
+  labs(title = "LOCF by biomarker", x = NULL,
+       y = "N patients with LOCF") +
+  theme(plot.margin = margin(r = 50))
+
+p1
+```
+
+\newpage
+
+# Fitting Functions
+
+```{r functions}
+# ══════════════════════════════════════════════════════════════════════════════
+# v7 fitting core: only two routines — LOCF (fallback for too-few-obs) and
+# fit_gam_gamma (GAM with Gamma family + log link, used for every other
+# (patient × biomarker) combination). Anchors are added by the dispatcher
+# before handing data to the fitter, and predictions always cover the full
+# GRID_DAYS (15 points).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── LOCF ──────────────────────────────────────────────────────────────────────
+# Last Observation Carried Forward on the full grid. For days before the
+# first observation, the first available value is used (NOCB).
+# Used whenever n_valid < 4 for a (patient × biomarker) combination, or as
+# an automatic fallback when the GAM fit fails to converge.
+impute_locf <- function(days_obs, y_obs, days_grid) {
+  ord      <- order(days_obs)
+  days_obs <- days_obs[ord];  y_obs <- y_obs[ord]
+  sapply(days_grid, function(d) {
+    idx <- which(days_obs <= d & !is.na(y_obs))
+    if (length(idx) == 0) {
+      fv <- y_obs[!is.na(y_obs)]
+      return(if (length(fv) == 0) NA_real_ else fv[1])
+    }
+    y_obs[max(idx)]
+  })
+}
+
+# ── Anchor points ─────────────────────────────────────────────────────────────
+# Stabilises the fit at grid boundaries by prepending / appending synthetic
+# observations on the raw scale:
+#   * day-0 anchor (always for GAM): (0, first_observed_value) if no day-0 obs.
+#   * day-14 anchor (short-stay only): (14, mean_observed_value) if day_max < 14.
+# This guarantees that GAM predictions on days_grid cover the full grid
+# without relying on long extrapolation.
+add_anchors <- function(d_obs, y_obs, GRID_MAX, day0 = TRUE, daymax = FALSE) {
+  valid <- !is.na(y_obs)
+
+  if (day0 && !0 %in% d_obs[valid]) {
+    first_val <- y_obs[valid][which.min(d_obs[valid])]
+    d_obs <- c(0,         d_obs)
+    y_obs <- c(first_val, y_obs)
+  }
+
+  if (daymax) {
+    mean_val <- mean(y_obs[!is.na(y_obs)])
+    d_obs <- c(d_obs, GRID_MAX)
+    y_obs <- c(y_obs, mean_val)
+  }
+
+  list(d = d_obs, y = y_obs)
+}
+
+# ── GAM fit with Gamma family and log link ────────────────────────────────────
+# The one and only spline fitter in v7. Non-negativity is structural
+# (mu = exp(eta) > 0), heteroscedasticity is native (Var(Y) = phi * mu^2),
+# smoothness is selected automatically via REML.
+#
+# Design contract:
+#   * Predicts on the FULL days_grid (length 15), always. Extrapolation
+#     outside the observed range is handled smoothly by the penalised spline.
+#   * Returns vectors of length length(days_grid), always. All outputs are
+#     cast to plain atomic numeric vectors (strips names/matrix attributes
+#     from predict.gam) so that downstream tibble + write_csv work cleanly.
+#
+# Arguments:
+#   days_obs, y_obs : observed (anchor-augmented) days and values
+#   days_grid       : prediction grid (full 0..14)
+#   k_basis         : upper bound on basis dimension. mgcv penalises down to
+#                     the effective complexity supported by the data.
+fit_gam_gamma <- function(days_obs, y_obs, days_grid, k_basis = 4) {
+
+  valid    <- !is.na(y_obs)
+  days_fit <- days_obs[valid]
+  y_fit    <- y_obs[valid]
+
+  # ── Zero-jitter ─────────────────────────────────────────────────────────────
+  # Gamma family requires y > 0 strictly. Biomarkers with biologically valid
+  # exact zeros (EOS, LYM, MONO, NEU, PLT) are handled here: each zero is
+  # replaced with half the smallest positive value observed for this
+  # (patient × biomarker) combination. Computed on-the-fly rather than
+  # stored in a global table — this keeps the fitter self-contained.
+  if (any(y_fit == 0)) {
+    pos_vals <- y_fit[y_fit > 0]
+    if (length(pos_vals) > 0) {
+      y_fit[y_fit == 0] <- 0.5 * min(pos_vals)
+    } else {
+      # Pathological edge case: all values are zero. Push everything off
+      # zero by a tiny amount so the Gamma likelihood is defined.
+      y_fit[y_fit == 0] <- 1e-6
+    }
+  }
+  # Final safety (defensive against negatives)
+  if (any(y_fit <= 0)) {
+    eps <- 0.5 * min(y_fit[y_fit > 0])
+    y_fit[y_fit <= 0] <- eps
+  }
+
+  tryCatch({
+    # Cap k at n_unique - 1 (mgcv requires k < n_unique)
+    k_use <- min(k_basis, length(unique(days_fit)) - 1)
+    if (k_use < 3) stop("not enough unique days for k >= 3")
+
+    # bs = "cr" : cubic regression spline basis
+    # method = "REML" : stable smoothness selection (Wood 2011)
+    fit_obj <- gam(y_fit ~ s(days_fit, bs = "cr", k = k_use),
+                   family = Gamma(link = "log"),
+                   method = "REML")
+
+    # Predict on the full grid, on the link (log) scale, with SE.
+    # Symmetric CI on the link scale → asymmetric CI on raw scale after
+    # back-transform, which is the correct behaviour for log-link models.
+    pred <- predict(fit_obj,
+                    newdata = data.frame(days_fit = days_grid),
+                    type    = "link",
+                    se.fit  = TRUE)
+
+    eta_hat <- as.numeric(pred$fit)      # strip names / matrix attrs
+    se_eta  <- as.numeric(pred$se.fit)
+
+    fit <- as.numeric(exp(eta_hat))
+    lwr <- as.numeric(exp(eta_hat - 2 * se_eta))
+    upr <- as.numeric(exp(eta_hat + 2 * se_eta))
+    # SE on response scale via delta method (diagnostic only)
+    se  <- as.numeric(fit * se_eta)
+
+    list(fit    = fit,
+         se     = se,
+         lwr    = lwr,
+         upr    = upr,
+         method = "GAM_Gamma_log")
+
+  }, error = function(e) {
+    warning(sprintf("GAM Gamma failed (k=%d): %s", k_basis, e$message))
+    locf <- impute_locf(days_obs, y_obs, days_grid)
+    list(fit = as.numeric(locf),
+         se  = rep(NA_real_, length(days_grid)),
+         lwr = rep(NA_real_, length(days_grid)),
+         upr = rep(NA_real_, length(days_grid)),
+         method = "LOCF_fallback")
+  })
+}
+
+# ── Master dispatcher ─────────────────────────────────────────────────────────
+# Routing logic:
+#   strategy == "LOCF" → impute_locf (and we're done)
+#   strategy == "GAM"  → add day-0 anchor; if day_max_bm < 14 also add day-14
+#                        anchor; then fit_gam_gamma
+# n_fit (observations + anchors) determines the k cap: k = min(6, max(3, ceil(n/2))).
+impute_one <- function(pid, bm, df_clean, feasibility, GRID_DAYS, GRID_MAX) {
+
+  pat   <- df_clean %>% filter(patient_id == pid) %>% arrange(day)
+  y_obs <- pat[[bm]]
+  d_obs <- pat$day
+
+  feas <- feasibility %>% filter(patient_id == pid, biomarker == bm)
+  strat      <- if (nrow(feas) == 0) "LOCF" else feas$strategy
+  day_max_bm <- if (nrow(feas) == 0) 0L     else feas$day_max_bm
+
+  # ── LOCF ──────────────────────────────────────────────────────────────────
+  if (strat == "LOCF") {
+    locf <- impute_locf(d_obs, y_obs, GRID_DAYS)
+    return(list(fit    = as.numeric(locf),
+                se     = rep(NA_real_, length(GRID_DAYS)),
+                lwr    = rep(NA_real_, length(GRID_DAYS)),
+                upr    = rep(NA_real_, length(GRID_DAYS)),
+                method = "LOCF"))
+  }
+
+  # ── GAM Gamma + log link ──────────────────────────────────────────────────
+  # Day-0 anchor always; day-14 anchor only if the patient's data don't
+  # already reach the end of the grid.
+  need_daymax_anchor <- day_max_bm < GRID_MAX
+  anch  <- add_anchors(d_obs, y_obs, GRID_MAX,
+                       day0   = TRUE,
+                       daymax = need_daymax_anchor)
+  d_fit <- anch$d;  y_fit <- anch$y
+
+  n_fit <- sum(!is.na(y_fit))
+  k_use <- min(6, max(3, ceiling(n_fit / 2)))
+
+  fit_gam_gamma(d_fit, y_fit, GRID_DAYS, k_basis = k_use)
+}
+```
+
+\newpage
+
+# Main Imputation Loop
+
+```{r imputation-loop, cache=TRUE}
+records_main   <- vector("list", length(eligible_ids))
+records_spline <- vector("list", length(eligible_ids) * length(bio_cols))
+spline_idx     <- 1L
+
+for (i in seq_along(eligible_ids)) {
+  pid <- eligible_ids[i]
+
+  bio_matrix <- matrix(NA_real_,
+                       nrow = length(GRID_DAYS),
+                       ncol = length(bio_cols),
+                       dimnames = list(NULL, bio_cols))
+
+  for (j in seq_along(bio_cols)) {
+    bm  <- bio_cols[j]
+    res <- impute_one(pid, bm, df_clean, feasibility, GRID_DAYS, GRID_MAX)
+
+    bio_matrix[, j] <- as.numeric(res$fit)
+
+    if (!startsWith(res$method, "LOCF")) {
+      # Defensive: force fit/se/lwr/upr to plain atomic numeric vectors.
+      # Some fitters (e.g. mgcv::predict.gam) may return named vectors or
+      # single-column matrices that would become list/matrix columns in
+      # the tibble and break readr::write_csv downstream.
+      records_spline[[spline_idx]] <- tibble(
+        patient_id = pid,
+        day        = GRID_DAYS,
+        biomarker  = bm,
+        fit        = as.numeric(res$fit),
+        se         = as.numeric(res$se),
+        lwr        = as.numeric(res$lwr),
+        upr        = as.numeric(res$upr),
+        method     = res$method
+      )
+      spline_idx <- spline_idx + 1L
+    }
+  }
+
+  records_main[[i]] <- bind_cols(
+    tibble(patient_id = pid, day = GRID_DAYS),
+    as_tibble(bio_matrix)
+  )
+}
+
+cat("Loop complete.\n")
+```
+
+\newpage
+
+# Output Datasets
+
+## Main dataset – wide format
+
+```{r assemble-main}
+df_main <- bind_rows(records_main) %>%
+  left_join(admission_covs, by = "patient_id") %>%
+  # ── Per-day in-hospital is_dead flag ─────────────────────────────────────
+  # 1 from the day of death onwards, 0 before. Always 0 for living patients
+  # (days_death_from_admission == -1 sentinel). Note that with the grid
+  # capped at day 14, in-hospital death is only visible inside the grid
+  # when it occurred within the first 14 days of admission.
+  mutate(
+    is_dead = if_else(
+      days_death_from_admission >= 0L & day >= days_death_from_admission,
+      1L, 0L
+    )
+  ) %>%
+  select(patient_id, day, all_of(bio_cols), all_of(cov_cols), is_dead)
+
+cat("Main output:", nrow(df_main), "rows ×", ncol(df_main), "cols\n")
+cat("Time points per patient:", n_distinct(df_main$day),
+    "(day 0 –", max(df_main$day), ")\n")
+cat("Patient-days flagged is_dead == 1:", sum(df_main$is_dead), "\n")
+glimpse(df_main)
+```
+
+## CRP–WBC discordance channel D(t)
+
+```{r add-discordance-channel}
+# ── Point 2: synthetic infection channel from CRP/WBC trend discordance ──────
+# Directional contrast of the standardized 2-day BACKWARD log-changes:
+#     D(t) = z(Δ log1p CRP) − z(Δ log1p WBC)
+# Large & positive when CRP RISES while WBC FALLS (the infective pattern the
+# clinicians flagged), minimal in the opposite case, ~0 when concordant.
+# Computed on the imputed regular grid (df_main = smooth GAM fit), on the log1p
+# scale so the change is a scale-stable log fold-change (CRP is heavily skewed).
+# D can be negative → it is deliberately NOT added to bio_cols, so it is never
+# log1p-transformed downstream and is skipped by the non-negativity check.
+# Backward (not centred) difference → future-leak-free and aligned with the
+# 2-day alert cadence used in the post-hoc notebook.
+INFECTION_ADD_D    <- FALSE
+INFECTION_CRP_COL  <- "CRP (mg/L)"
+INFECTION_WBC_COL  <- "WBC (10^9/L)"
+INFECTION_D_NAME   <- "CRP-WBC discordance"
+INFECTION_LAG_DAYS <- 2L
+
+if (INFECTION_ADD_D) {
+  miss <- setdiff(c(INFECTION_CRP_COL, INFECTION_WBC_COL), names(df_main))
+  if (length(miss) > 0)
+    stop("D(t) needs imputed CRP and WBC in df_main. Missing: ",
+         paste(miss, collapse = ", "),
+         ". Add them to BIOMARKERS_TO_USE and re-run from the top.")
+
+  df_main <- df_main %>%
+    arrange(patient_id, day) %>%
+    group_by(patient_id) %>%
+    mutate(
+      .lcrp = log1p(.data[[INFECTION_CRP_COL]]),
+      .lwbc = log1p(.data[[INFECTION_WBC_COL]]),
+      .dCRP = .lcrp - dplyr::lag(.lcrp, INFECTION_LAG_DAYS),
+      .dWBC = .lwbc - dplyr::lag(.lwbc, INFECTION_LAG_DAYS)
+    ) %>%
+    ungroup()
+
+  .sCRP <- sd(df_main$.dCRP, na.rm = TRUE)
+  .sWBC <- sd(df_main$.dWBC, na.rm = TRUE)
+  if (!is.finite(.sCRP) || .sCRP == 0 || !is.finite(.sWBC) || .sWBC == 0)
+    stop("Zero/undefined SD for the CRP or WBC 2-day change — cannot standardize D(t).")
+
+  d_vec <- (df_main$.dCRP / .sCRP) - (df_main$.dWBC / .sWBC)
+  d_vec[is.na(d_vec)] <- 0            # days 0..(lag-1) have no 2-day history
+  df_main[[INFECTION_D_NAME]] <- d_vec
+
+  # Drop the scratch columns and pin a stable column order:
+  # id/day → biomarkers → D → covariates → is_dead
+  df_main <- df_main %>%
+    select(-.lcrp, -.lwbc, -.dCRP, -.dWBC) %>%
+    select(patient_id, day, all_of(bio_cols),
+           all_of(INFECTION_D_NAME), all_of(cov_cols), is_dead)
+
+  cat(sprintf("D(t) channel '%s' added (lag = %d days). Range [%.2f, %.2f]; SD = %.3f\n",
+              INFECTION_D_NAME, INFECTION_LAG_DAYS,
+              min(df_main[[INFECTION_D_NAME]]), max(df_main[[INFECTION_D_NAME]]),
+              sd(df_main[[INFECTION_D_NAME]])))
+} else {
+  cat("INFECTION_ADD_D = FALSE → D(t) channel not created.\n")
+}
+```
+
+## Spline-only dataset – long format for functional clustering
+
+```{r assemble-spline}
+df_spline <- bind_rows(records_spline[1:(spline_idx - 1)])
+
+cat("Spline output:", nrow(df_spline), "rows ×", ncol(df_spline), "cols\n")
+cat("NCS+SS combinations:",
+    n_distinct(paste(df_spline$patient_id, df_spline$biomarker)), "\n")
+cat("Methods:", paste(sort(unique(df_spline$method)), collapse = ", "), "\n")
+```
+
+```{r negativity-check}
+# Sanity check: count negative imputed values per biomarker.
+# With log1p + zero-jitter, this should be exactly zero everywhere.
+neg_counts <- df_main %>%
+  pivot_longer(all_of(bio_cols), names_to = "biomarker", values_to = "v") %>%
+  group_by(biomarker) %>%
+  summarise(
+    n_total    = sum(!is.na(v)),
+    n_negative = sum(v < 0, na.rm = TRUE),
+    n_zero     = sum(v == 0, na.rm = TRUE),
+    min_value  = min(v, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(n_negative))
+
+cat("── Post-imputation negativity check ────────────────────────────────\n")
+print(neg_counts, n = length(bio_cols))
+
+if (sum(neg_counts$n_negative) == 0) {
+  cat("\nNo negative imputed values anywhere - non-negativity holds.\n")
+} else {
+  cat("\nWARNING:", sum(neg_counts$n_negative),
+      "negative imputed values found across",
+      sum(neg_counts$n_negative > 0), "biomarkers.\n")
+  cat("  With GAM Gamma + log link this should not happen — investigate.\n")
+}
+```
+
+```{r save}
+df_main <- df_main %>% mutate(discharge_dead = as.integer(1 - discharged_alive)) %>% select(-discharged_alive)
+write_csv(df_main,   "df_imputed_wide.csv")
+write_csv(df_spline, "df_spline_long.csv")
+cat("Saved: df_imputed_wide.csv  |  df_spline_long.csv\n")
+```
+
+
+```{r}
+df_long_plot <- df_main %>%
+  pivot_longer(
+    cols = all_of(bio_cols),
+    names_to = "label",
+    values_to = "value"
+  ) %>%
+  filter(!is.na(value))
+
+# Density plot
+ggplot(df_long_plot, aes(x = value)) +
+  geom_density(fill = "#2ECC71", alpha = 0.5, colour = "#27AE60") +
+  facet_wrap(~ label, scales = "free", ncol = 4) +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text = element_text(face = "bold", size = 8),
+    plot.title = element_text(face = "bold", size = 13)
+  ) +
+  labs(
+    title = "Density Distributions of Biomarkers",
+    x = "Value",
+    y = "Density"
+  )
+```
+
+\newpage
+
+# Diagnostic Plots
+
+## Plot function
+
+- **Red circles** – observed values
+- **Blue solid** – NCS fit (within observed range), **±2 SE ribbon** (asymmetric if log-transformed)
+- **Blue dashed** – linear tail (NCS edge case beyond last obs, rare)
+- **Green solid** – SS_df4 fit (full grid, includes both anchors), **±2 SE ribbon**
+- **Orange solid** – LOCF
+- **Grey dashed vertical** – day 14 (grid end)
+- **Filled triangle** – synthetic anchor point(s) used in fitting
+
+Note: when log-transform is active, the CI ribbon is asymmetric (wider above,
+narrower below the fit line), which is the correct behaviour for a log-normal
+back-transform. Fitted values are always non-negative.
+
+```{r plot-function}
+plot_one <- function(df_raw, df_spline_long, pid, bm, GRID_DAYS,
+                     y_limits = NULL) {
+
+  obs <- df_raw %>%
+    filter(patient_id == pid) %>%
+    select(day, value = all_of(bm)) %>%
+    filter(!is.na(value))
+
+  sp <- df_spline_long %>%
+    filter(patient_id == pid, biomarker == bm)
+
+  is_spline <- nrow(sp) > 0
+  strat     <- if (is_spline) unique(sp$method) else "LOCF"
+  is_gam    <- startsWith(strat, "GAM")
+
+  # Short-stay (day-14 anchor was added) is detected from the observed data,
+  # since the method string itself doesn't encode it.
+  obs_day_max <- if (nrow(obs) > 0) max(obs$day) else NA_real_
+  is_gam_short <- is_gam && !is.na(obs_day_max) &&
+                  obs_day_max < max(GRID_DAYS)
+
+  # LOCF reconstruction (no spline data available for this combination)
+  if (!is_spline) {
+    pat  <- df_raw %>% filter(patient_id == pid)
+    locf <- impute_locf(pat$day, pat[[bm]], GRID_DAYS)
+    sp   <- tibble(day = GRID_DAYS, fit = locf,
+                   se = NA_real_, lwr = NA_real_, upr = NA_real_)
+  }
+
+  # Anchor markers (day-0 for any GAM; day-14 for short-stay GAM)
+  anchors <- tibble(day = numeric(), val = numeric(), type = character())
+  if (is_spline) {
+    real_obs <- obs
+    if (nrow(real_obs) > 0 && min(real_obs$day) > 0) {
+      anchors <- bind_rows(anchors,
+                           tibble(day  = 0,
+                                  val  = real_obs$value[which.min(real_obs$day)],
+                                  type = "day-0 anchor"))
+    }
+    if (is_gam_short) {
+      y_vals <- df_raw %>% filter(patient_id == pid) %>% pull(all_of(bm))
+      anchors <- bind_rows(anchors,
+                           tibble(day  = max(GRID_DAYS),
+                                  val  = mean(y_vals, na.rm = TRUE),
+                                  type = "day-14 anchor"))
+    }
+  }
+
+  col_gam  <- "#8e44ad"   # purple for GAM Gamma + log link
+  col_locf <- "darkorange"
+
+  p <- ggplot()
+
+  # Ribbon (GAM only — LOCF has no CI)
+  if (is_gam && any(!is.na(sp$lwr)))
+    p <- p + geom_ribbon(data = sp,
+                         aes(x = day, ymin = lwr, ymax = upr),
+                         fill = col_gam, alpha = 0.18)
+
+  # Fitted line
+  if (is_gam)
+    p <- p + geom_line(data = sp, aes(x = day, y = fit),
+                       color = col_gam, linewidth = 0.9)
+  if (!is_spline)
+    p <- p + geom_line(data = sp, aes(x = day, y = fit),
+                       color = col_locf, linewidth = 0.9)
+
+  # Observed points
+  p <- p + geom_point(data = obs, aes(x = day, y = value),
+                      color = "red", size = 1.2, shape = 19)
+
+  # Anchor markers
+  if (nrow(anchors) > 0)
+    p <- p + geom_point(data = anchors, aes(x = day, y = val),
+                        shape = 17, size = 2, color = "grey30")
+
+  p <- p +
+    geom_vline(xintercept = max(GRID_DAYS), linetype = "dashed",
+               color = "grey55", linewidth = 0.4) +
+    labs(title    = bm,
+         subtitle = strat,
+         x = NULL, y = NULL) +
+    theme(legend.position = "none",
+          plot.title    = element_text(size = 8, face = "bold"),
+          plot.subtitle = element_text(size = 7))
+
+  if (!is.null(y_limits))
+    p <- p + coord_cartesian(ylim = y_limits, xlim = range(GRID_DAYS))
+
+  p
+}
+```
+
+## All biomarkers – one representative patient {.unnumbered}
+
+```{r plot-rep-patient-p1, fig.width=14, fig.height=9}
+# Patient with the most NCS combinations (richest data)
+rep_pid <- feasibility %>%
+  filter(strategy == "NCS") %>%
+  count(patient_id) %>%
+  arrange(desc(n)) %>%
+  slice(1) %>%
+  pull(patient_id)
+
+# Or set manually for debugging:
+rep_pid <- "9f5e8667-cb23-a5fe-7f4e-3a1d24bc9fcd"
+
+cat("Representative patient:", rep_pid, "\n")
+
+pl <- lapply(bio_cols, function(bm)
+  plot_one(df_clean, df_spline, rep_pid, bm, GRID_DAYS))
+
+N_BIO <- length(BIOMARKERS_TO_USE)
+
+wrap_plots(pl[1:N_BIO], ncol = 4) +
+  plot_annotation(
+    title    = sprintf("Patient %s  –  biomarkers 1/2", rep_pid),
+    subtitle = paste("Purple = GAM Gamma(log) ±2SE",
+                     "Orange = LOCF  |  ▲ = anchor  |  Dashed = beyond obs range"),
+                   caption  = "x: day since admission   |   y: biomarker value",
+    theme    = theme(plot.title    = element_text(size = 11),
+                     plot.subtitle = element_text(size = 8))
+  )
+```
+
+\newpage
+
+```{r plot-rep-patient-p2, fig.width=14, fig.height=9, eval=FALSE}
+wrap_plots(pl[13:length(bio_cols)], ncol = 4) +
+  plot_annotation(
+    title    = sprintf("Patient %s  –  biomarkers 2/2", rep_pid),
+    subtitle = paste("Purple = GAM Gamma(log) ±2SE",
+                     "Orange = LOCF  |  ▲ = anchor  |  Dashed = beyond obs range"),
+    caption  = "x: day since admission   |   y: biomarker value (raw scale; CI may be asymmetric for log1p-transformed biomarkers)",
+    theme    = theme(plot.title    = element_text(size = 11),
+                     plot.subtitle = element_text(size = 8))
+  )
+```
+
+\newpage
+
+## Sample of 12 patients – per biomarker {.unnumbered}
+
+
+```{r sample-plots}
+FIG_DIR <- "figures"
+dir.create(FIG_DIR, showWarnings = FALSE)
+
+TW      <- 5.51   # inches = 140 mm. Replace with your \the\textwidth if different.
+N_PANEL <- 12
+N_LOCF  <- 2      # fallback cases to force into each grid
+
+fig_files <- c("HGB (g/dL)"   = "gam_sample_hgb.pdf",
+               "CREA (mg/dL)" = "gam_sample_crea.pdf",
+               "ALT (U/L)"    = "gam_sample_alt.pdf")
+
+for (bm in bio_cols) {
+
+  # --- panel selection: force N_LOCF fallback cases, fill the rest with GAM ---
+  gam_ids_bm  <- df_spline %>% filter(biomarker == bm) %>%
+                 pull(patient_id) %>% unique()
+  locf_ids_bm <- setdiff(eligible_ids, gam_ids_bm)
+
+  set.seed(1)
+  n_locf  <- min(N_LOCF, length(locf_ids_bm))
+  pick_lo <- locf_ids_bm[sample.int(length(locf_ids_bm), n_locf)]
+  pick_ga <- gam_ids_bm[ sample.int(length(gam_ids_bm),  N_PANEL - n_locf)]
+  ids_bm  <- c(pick_lo, pick_ga)
+
+  # --- common y range across the panels of this biomarker ---
+  all_obs <- df_clean %>% filter(patient_id %in% ids_bm) %>%
+             pull(all_of(bm)) %>% na.omit()
+  all_fit <- df_spline %>% filter(patient_id %in% ids_bm, biomarker == bm) %>%
+             pull(fit)
+  y_lim <- quantile(c(all_obs, all_fit), probs = c(0.01, 0.99), na.rm = TRUE)
+
+  # --- build panels; drop the per-panel biomarker title, keep the method ---
+  pl_bm <- lapply(ids_bm, function(pid)
+    plot_one(df_clean, df_spline, pid, bm, GRID_DAYS, y_limits = y_lim) +
+      labs(title = NULL))
+
+  pw <- wrap_plots(pl_bm, ncol = 3) &
+        theme_bw(base_size = 8) &
+        theme(legend.position  = "none",
+              plot.subtitle    = element_text(size = 6.5),
+              panel.grid.minor = element_blank(),
+              plot.margin      = margin(2, 2, 2, 2))
+
+  ggsave(file.path(FIG_DIR, fig_files[[bm]]), pw,
+         width = TW, height = 6.2, units = "in", device = cairo_pdf)
+
+  cat(sprintf("saved %s  (%d LOCF panels)\n", fig_files[[bm]], n_locf))
+  print(pw)
+  cat("\n\n\\newpage\n\n")
+}
+```
+```
+
+\newpage
+
+
+
+# Outlier Analysis
+
+This section investigates the heavy tails present in the biomarker distributions.
+
+**Strategies compared:**
+
+| # | Transform | Outlier criterion |
+|---|-----------|-------------------|
+| 1 | None (raw) | outside \[Q1 − 3·IQR, Q3 + 3·IQR\] on raw scale |
+| 2 | log(x) | outside \[Q1 − 3·IQR, Q3 + 3·IQR\] on log scale |
+| 3 | log(log(x)) | outside \[Q1 − 3·IQR, Q3 + 3·IQR\] on log-log scale |
+
+A patient is removed under a strategy if **at least one** of their measurements
+(across all biomarkers) is flagged as an outlier.
+
+**Notes on applicability:**
+
+- **log(x)** requires all values > 0; biomarkers that include 0 or negatives
+  are excluded from this comparison and marked as `NA`.
+- **log(log(x))** additionally requires all values > 1 (so that log(x) > 0);
+  biomarkers failing this are also marked `NA`.
+
+
+
+
+```{r outlier-helper}
+# Flag values outside k × IQR from Q1/Q3; returns logical vector
+flag_outliers_iqr <- function(x, k = 3) {
+  q   <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  iqr <- q[2] - q[1]
+  if (iqr == 0) return(rep(FALSE, length(x)))   # constant biomarker → no outliers
+  (x < q[1] - k * iqr) | (x > q[2] + k * iqr)
+}
+```
+
+```{r outlier-per-biomarker}
+# Long format (eligible patients only, observed values only)
+bio_long_clean <- df_clean %>%
+  pivot_longer(cols = all_of(bio_cols),
+               names_to = "biomarker", values_to = "value") %>%
+  filter(!is.na(value))
+
+# Per-biomarker: check feasibility of each transform
+bm_outlier_info <- bio_long_clean %>%
+  group_by(biomarker) %>%
+  summarise(
+    n_obs      = n(),
+    min_val    = min(value),
+    max_val    = max(value),
+    can_log1p  = all(value >= 0),   # log1p  x ≥ 0
+    can_loglog = all(value > 0),    # for log(log1p(x)) needs log1p(x) > 0 → x > 0
+    .groups    = "drop"
+  )
+
+# Flag outliers on each scale, per biomarker
+outlier_flags <- bio_long_clean %>%
+  left_join(bm_outlier_info %>% select(biomarker, can_log1p, can_loglog),
+            by = "biomarker") %>%
+  group_by(biomarker) %>%
+  mutate(
+    outlier_raw = flag_outliers_iqr(value),
+
+    outlier_log1p = if (first(can_log1p)) 
+      flag_outliers_iqr(log1p(value)) 
+    else NA,
+
+    outlier_loglog = if (first(can_loglog)) 
+      flag_outliers_iqr(log(log1p(value))) 
+    else NA
+  ) %>%
+  ungroup()
+```
+
+```{r outlier-patient-counts}
+# Helper: unique patients flagged under a given column
+n_patients_flagged <- function(col) {
+  outlier_flags %>%
+    filter(!is.na(.data[[col]]) & .data[[col]]) %>%
+    pull(patient_id) %>%
+    n_distinct()
+}
+
+n_raw    <- n_patients_flagged("outlier_raw")
+n_log    <- n_patients_flagged("outlier_log1p")
+n_loglog <- n_patients_flagged("outlier_loglog")
+
+cat("═══════════════════════════════════════════════════════════════════════\n")
+cat("   OUTLIER REMOVAL IMPACT — patients that WOULD be excluded\n")
+cat("   (based on ≥1 measurement outside 3×IQR on the stated scale)\n")
+cat("═══════════════════════════════════════════════════════════════════════\n")
+tibble(
+  Strategy          = c("Raw (no transform)",
+                         "Log scale  [log1p(x); only if x >= 0]",
+                         "Log-log scale [log(log1p(x)); only if x > 0]"),
+  Patients_removed  = c(n_raw, n_log, n_loglog),
+  Pct_of_eligible   = sprintf("%.1f%%",
+                               100 * c(n_raw, n_log, n_loglog) / length(eligible_ids))
+) %>% print()
+```
+
+```{r outlier-per-biomarker-table}
+# Per-biomarker breakdown: how many patients are flagged per strategy?
+bm_outlier_summary <- outlier_flags %>%
+  group_by(biomarker) %>%
+  summarise(
+    n_measures       = n(),
+    n_patients       = n_distinct(patient_id),
+    # Raw
+    n_flag_raw       = sum(outlier_raw, na.rm = TRUE),
+    pct_flag_raw     = round(100 * n_flag_raw / n_measures, 1),
+    # Log
+    can_log1p          = first(can_log1p),
+    n_flag_log1p       = sum(outlier_log1p,    na.rm = TRUE),
+    pct_flag_log1p     = round(100 * n_flag_log1p / n_measures, 1),
+    # Log-log
+    can_loglog       = first(can_loglog),
+    n_flag_loglog    = sum(outlier_loglog, na.rm = TRUE),
+    pct_flag_loglog  = round(100 * n_flag_loglog / n_measures, 1),
+    .groups          = "drop"
+  ) %>%
+  mutate(
+    pct_flag_log1p    = if_else(can_log1p,    pct_flag_log1p,    NA_real_),
+    pct_flag_loglog = if_else(can_loglog, pct_flag_loglog, NA_real_)
+  ) %>%
+  select(-can_log1p, -can_loglog) %>%
+  arrange(desc(n_flag_raw))
+
+cat("\n── Per-biomarker outlier rates (% of measurements flagged) ──\n")
+print(bm_outlier_summary, n = length(bio_cols))
+```
+
+```{r outlier-plots, fig.height=8}
+# Distribution plots: raw vs log vs log-log for each biomarker
+# Show one representative plot per biomarker (histogram + 3×IQR bounds)
+# Distribution plots: RAW scale for each biomarker
+# One plot per biomarker (histogram + 3×IQR bounds)
+
+bm_dist_plots <- lapply(bio_cols, function(bm) {
+
+  bm_info <- bm_outlier_info %>% filter(biomarker == bm)
+
+  # Extract raw values
+  vals <- bio_long_clean %>%
+    filter(biomarker == bm) %>%
+    pull(value)
+
+  # Compute IQR bounds on RAW scale
+  q   <- quantile(vals, c(0.25, 0.75))
+  iqr <- q[2] - q[1]
+  lo  <- q[1] - 3 * iqr
+  hi  <- q[2] + 3 * iqr
+
+  # Plot histogram with outlier bounds
+  ggplot(tibble(x = vals), aes(x = x)) +
+    geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+    geom_vline(xintercept = c(lo, hi),
+               color = "red",
+               linetype = "dashed",
+               linewidth = 0.6) +
+    labs(
+      title = bm,
+      subtitle = sprintf("RAW scale | 3×IQR bounds: [%.2g, %.2g]", lo, hi),
+      x = NULL,
+      y = NULL
+    ) +
+    theme(
+      plot.title    = element_text(size = 8, face = "bold"),
+      plot.subtitle = element_text(size = 6)
+    )
+})
+
+# Print 12 plots per page
+n_pages <- ceiling(length(bio_cols) / 12)
+
+for (pg in seq_len(n_pages)) {
+
+  idx <- ((pg - 1) * 12 + 1):min(pg * 12, length(bio_cols))
+
+  print(
+    wrap_plots(bm_dist_plots[idx], ncol = 4) +
+      plot_annotation(
+        title = sprintf("RAW distribution + 3×IQR outlier bounds (%d/%d)",
+                        pg, n_pages),
+        subtitle = "Red dashed lines = Q1−3×IQR and Q3+3×IQR | Values outside → flagged as outliers",
+        theme = theme(
+          plot.title    = element_text(size = 11),
+          plot.subtitle = element_text(size = 8)
+        )
+      )
+  )
+
+  cat("\n\n\\newpage\n\n")
+}
+
+# Distribution plots: LOG1P scale for each biomarker
+# Same structure as RAW, but computed on log1p(x)
+
+bm_dist_plots_log <- lapply(bio_cols, function(bm) {
+
+  bm_info <- bm_outlier_info %>% filter(biomarker == bm)
+
+  # Extract raw values
+  vals <- bio_long_clean %>%
+    filter(biomarker == bm) %>%
+    pull(value)
+
+  # Skip biomarkers with negative values (log1p not defined)
+  if (!bm_info$can_log1p) return(NULL)
+
+  # Apply log1p transformation
+  vals_log <- log1p(vals)
+
+  # Compute IQR bounds on LOG1P scale
+  q   <- quantile(vals_log, c(0.25, 0.75))
+  iqr <- q[2] - q[1]
+  lo  <- q[1] - 3 * iqr
+  hi  <- q[2] + 3 * iqr
+
+  # Plot histogram
+  ggplot(tibble(x = vals_log), aes(x = x)) +
+    geom_histogram(bins = 40, fill = "#55A868", alpha = 0.7) +
+    geom_vline(xintercept = c(lo, hi),
+               color = "#C44E52",
+               linetype = "dashed",
+               linewidth = 0.6) +
+    labs(
+      title = bm,
+      subtitle = sprintf("log1p scale | 3×IQR bounds: [%.2g, %.2g]", lo, hi),
+      x = NULL,
+      y = NULL
+    ) +
+    theme(
+      plot.title    = element_text(size = 8, face = "bold"),
+      plot.subtitle = element_text(size = 6)
+    )
+})
+
+# Remove NULL entries (non-compatible biomarkers)
+bm_dist_plots_log <- bm_dist_plots_log[!sapply(bm_dist_plots_log, is.null)]
+
+# Print 12 plots per page
+n_pages_log <- ceiling(length(bm_dist_plots_log) / 12)
+
+for (pg in seq_len(n_pages_log)) {
+
+  idx <- ((pg - 1) * 12 + 1):min(pg * 12, length(bm_dist_plots_log))
+
+  print(
+    wrap_plots(bm_dist_plots_log[idx], ncol = 4) +
+      plot_annotation(
+        title = sprintf("LOG1P distribution + 3×IQR outlier bounds (%d/%d)",
+                        pg, n_pages_log),
+        subtitle = "Transform: log1p(x) | Red dashed lines = Q1−3×IQR and Q3+3×IQR",
+        theme = theme(
+          plot.title    = element_text(size = 11),
+          plot.subtitle = element_text(size = 8)
+        )
+      )
+  )
+
+  cat("\n\n\\newpage\n\n")
+}
+```
+
+\newpage
+
+# Downstream-Ready Dataset: Skewness-Based log1p Transform
+
+```{r log1p-transform-for-downstream}
+# ══════════════════════════════════════════════════════════════════════════════
+# Downstream-ready dataset: apply log1p to heavily skewed biomarkers so the
+# HMM / clustering / outlier detection downstream sees distributions closer
+# to symmetric.
+#
+# Decision rule: log1p is applied to a biomarker iff sample skewness on the
+# IMPUTED values (df_main) exceeds SKEW_THRESHOLD_LOG. Skewness is computed
+# on raw-scale imputed values, which are guaranteed positive (so log1p is
+# always defined).
+#
+# IMPORTANT — for clinical interpretation:
+#   The raw-scale CSV (df_imputed_wide.csv) stays unchanged. The log1p
+#   version is saved as a SEPARATE file (df_imputed_wide_log1p.csv). A
+#   decision table documenting which biomarkers were transformed is saved
+#   as bm_log1p_decisions.csv. When interpreting any downstream output
+#   (states, trajectories, clusters) that used the log1p-transformed
+#   biomarkers, remember to back-transform with expm1() to return to the
+#   original clinical units (e.g. mg/L for CRP, U/L for LDH, etc.).
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKEW_THRESHOLD_LOG <- 1.0   # |skew| above which log1p is applied
+
+# Sample skewness (Fisher-Pearson, bias-corrected) on imputed values
+.sample_skewness <- function(x) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  if (n < 3) return(NA_real_)
+  m <- mean(x); s <- sd(x)
+  if (s == 0) return(0)
+  (n / ((n - 1) * (n - 2))) * sum(((x - m) / s)^3)
+}
+
+# Skewness per biomarker on the IMPUTED dataset (df_main, raw scale)
+bm_log1p_decisions <- tibble(biomarker = bio_cols) %>%
+  rowwise() %>%
+  mutate(
+    skew_imputed = .sample_skewness(df_main[[biomarker]]),
+    apply_log1p  = is.finite(skew_imputed) &&
+                   abs(skew_imputed) > SKEW_THRESHOLD_LOG
+  ) %>%
+  ungroup() %>%
+  arrange(desc(apply_log1p), desc(abs(skew_imputed)))
+
+cat("══════════════════════════════════════════════════════════════════════\n")
+cat("   log1p transform decisions for the DOWNSTREAM-READY dataset\n")
+cat("══════════════════════════════════════════════════════════════════════\n")
+cat(sprintf("Threshold: |skew| > %g\n\n", SKEW_THRESHOLD_LOG))
+print(bm_log1p_decisions, n = length(bio_cols))
+
+bm_log1p <- bm_log1p_decisions %>%
+  filter(apply_log1p) %>%
+  pull(biomarker)
+
+cat("\n── Biomarkers that WILL be log1p-transformed ────────────────────────\n")
+if (length(bm_log1p) == 0) {
+  cat("(none)\n")
+} else {
+  for (bm in bm_log1p) cat("  -", bm, "\n")
+}
+cat(sprintf("\nTotal: %d / %d biomarkers transformed\n",
+            length(bm_log1p), length(bio_cols)))
+
+# Build the log1p-transformed dataset. Only the selected biomarkers are
+# transformed; the rest are left on raw scale. ID and covariate columns
+# are preserved untouched.
+df_main_log1p <- df_main %>%
+  mutate(across(all_of(bm_log1p), log1p))
+
+# Sanity check: no NaN / Inf introduced by log1p (shouldn't happen since
+# imputed values are strictly positive, but worth checking)
+sanity_bad <- df_main_log1p %>%
+  summarise(across(all_of(bm_log1p),
+                   ~ sum(!is.finite(.x) & !is.na(.x)))) %>%
+  pivot_longer(everything(),
+               names_to = "biomarker", values_to = "n_bad") %>%
+  filter(n_bad > 0)
+
+if (nrow(sanity_bad) > 0) {
+  cat("\nWARNING: log1p produced non-finite values in some biomarkers:\n")
+  print(sanity_bad)
+} else {
+  cat("\nlog1p applied cleanly (no NaN/Inf introduced)\n")
+}
+
+# Save the three files:
+#   1. bm_log1p_decisions.csv — which biomarkers were transformed and why
+#   2. df_imputed_wide.csv    — raw-scale, unchanged (re-saved for safety)
+#   3. df_imputed_wide_log1p.csv — log1p applied to the flagged biomarkers
+write_csv(bm_log1p_decisions, "bm_log1p_decisions.csv")
+write_csv(df_main,            "df_imputed_wide.csv")
+write_csv(df_main_log1p,      "df_imputed_wide_log1p.csv")
+
+cat("\n── Files saved ──────────────────────────────────────────────────────\n")
+cat("  bm_log1p_decisions.csv    (decision table)\n")
+cat("  df_imputed_wide.csv       (raw scale, unchanged)\n")
+cat("  df_imputed_wide_log1p.csv (log1p applied to flagged biomarkers)\n")
+```
+
+\newpage
+
+
+
+
+# Final Summary
+
+```{r final-summary}
+cat("═══════════════════════════════════════════════════════════════════════\n")
+cat("                        FINAL SUMMARY\n")
+cat("═══════════════════════════════════════════════════════════════════════\n")
+cat(sprintf("Original patients:                        %d\n",
+            n_distinct(df$patient_id)))
+cat(sprintf("Excluded – narrow day range (<5 days):    %d\n",
+            length(excl_only_narrow) + length(excl_both)))
+cat(sprintf("Excluded – sparse biomarker (<3 obs):     %d\n",
+            length(excl_only_sparse) + length(excl_both)))
+cat(sprintf("  (of which both criteria):               %d\n",
+            length(excl_both)))
+cat(sprintf("Total excluded:                           %d\n",
+            length(excluded_ids)))
+cat(sprintf("Eligible patients:                        %d\n",
+            length(eligible_ids)))
+cat(sprintf("Biomarkers:                               %d\n",
+            length(bio_cols)))
+cat(sprintf("Prediction grid:                          day 0 – %d (%d points)\n",
+            GRID_MAX, length(GRID_DAYS)))
+cat(sprintf("Unified model: GAM Gamma + log link (mgcv)\n"))
+cat(sprintf("\nMain output (df_imputed_wide):  %d rows × %d cols\n",
+            nrow(df_main), ncol(df_main)))
+cat(sprintf("Spline output (df_spline_long): %d rows × %d cols\n",
+            nrow(df_spline), ncol(df_spline)))
+
+cat("\n── Strategy breakdown ──────────────────────────────────────────────────\n")
+feasibility %>%
+  count(strategy) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  rename(combinations = n) %>%
+  print()
+
+cat("\n── Method actually used (post-fit) ────────────────────────────────────\n")
+# Count LOCF (from feasibility) + GAM successes + LOCF fallbacks (failed GAMs)
+df_spline %>%
+  distinct(patient_id, biomarker, method) %>%
+  count(method) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n)) %>%
+  print()
+
+cat("\n── Outlier analysis summary (for analyst decision) ─────────────────────\n")
+tibble(
+  Strategy         = c("Raw (no transform)",
+                        "Log scale  [log(x)]",
+                        "Log-log scale [log(log(x))]"),
+  Patients_removed = c(n_raw, n_log, n_loglog),
+  Pct_of_eligible  = sprintf("%.1f%%",
+                              100 * c(n_raw, n_log, n_loglog) / length(eligible_ids))
+) %>% print()
+```

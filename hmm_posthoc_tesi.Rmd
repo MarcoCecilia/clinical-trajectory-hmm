@@ -1,0 +1,3528 @@
+---
+title: "HMM Post-hoc Analyses — Chapter 4 (Phenotype-Based Analyses)"
+subtitle: "Admission depth phenotypes, day-7 online decoding, outcome models, and the day-7 alert"
+author: 'Marco Cecilia'
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+<!--
+=============================================================================
+ SCOPE OF THIS REWRITE
+=============================================================================
+ This notebook is the Chapter-4 companion to hmm_training_tesi.Rmd. It was
+ rewritten to match the decisions taken for Chapter 3 and Chapter 4:
+
+   * NO TRAIN/TEST SPLIT anywhere. The bundle no longer carries `test_data`
+     and every held-out / out-of-sample analysis has been deleted, including
+     the old Section 1 (decode test patients) and Section 2.10 (validation
+     against held-out Viterbi).
+   * The day-7 DEPTH anchor (old Section 3bis) has been deleted in full,
+     together with everything cascading from it (3bis.6, the three-anchor
+     comparison of 3ter.5, the day-7 depth KM stratum).
+   * DD-plots (old 2.7) and the breakdown-point simulation (old 2.8) have
+     been deleted in full.
+   * STAYER_WINDOW is fixed at 14 (the whole grid), so the stayer/switcher
+     split reproduces Chapter 3 exactly: 887 stayers / 152 switchers.
+
+ Two branches survive and only these two propagate downstream:
+   (A) the ADMISSION anchor  — depth phenotype from the day-0 vector alone;
+   (B) the DAY-7 ONLINE anchor — Viterbi on the panel truncated to 0..7.
+ (B) is leak-free IN TIME, not in patients. It must never be described as
+ out-of-sample.
+
+ Chapter 4 section map (the numbering below mirrors the chapter):
+   1 -> 4.1 State-occupancy patterns: stayers and switchers
+   2 -> 4.2 Admission phenotypes from statistical depth
+   3 -> 4.3 Classification anchors
+   4 -> 4.4 In-hospital and 90-day mortality across phenotypes
+   5 -> 4.5 Survival across phenotypes
+   6 -> 4.6 Trajectory dynamics and the day-7 alert
+=============================================================================
+-->
+
+# 0. Setup
+
+This notebook depends on the fitted-model bundle written by
+`hmm_training_tesi.Rmd` in its Section 12. Run that notebook first.
+
+**Scope**: post-hoc analyses for the **covariate-free** HMM. Covariates
+never enter the HMM; they appear here only as descriptors and as
+adjustment terms in the outcome models of Sections 4 and 6.
+
+## 0.1 Configuration
+
+```{r config}
+# ── Bundle ───────────────────────────────────────────────────────────────────
+# The training notebook writes hmm_fit_objects_tesi4.rds. The first existing
+# path wins, so older bundle names still work without editing this chunk.
+BUNDLE_CANDIDATES <- c("hmm_fit_objects_tesi4.rds")
+BUNDLE_PATH <- BUNDLE_CANDIDATES[file.exists(BUNDLE_CANDIDATES)][1]
+stopifnot(!is.na(BUNDLE_PATH))
+
+# ── Output directory for figures and tables ─────────────────────────────────
+FIG_DIR <- "figures_ch4"
+TAB_DIR <- "tables_ch4"
+
+# ── Stayer definition ────────────────────────────────────────────────────────
+# FIXED at 14, i.e. the whole observation grid (days 0..14). A patient is a
+# stayer iff the globally decoded state is constant over the entire window,
+# which is the definition |S_i| = 1 fixed in Chapter 3. Do NOT change this:
+# any other value desynchronises every count in this notebook from
+# Chapter 3's Table "Stayers by state" (887 / 152, split 273/233/207/174).
+STAYER_WINDOW <- 14L
+
+# ── Depth-based "central population" cut (Section 2) ─────────────────────────
+# Fraction of the post-outlier population retained as the central core of each
+# state. Two-step filter: drop depth = 0 (outside the convex hull), then keep
+# the deepest CENTRAL_FRAC fraction. CENTRAL_FRAC = 1 disables the second step.
+CENTRAL_FRAC <- 0.50
+
+# Warn-flag threshold on the max-across-states depth of a classified patient.
+# Patients below it are flagged as atypical but still assigned.
+OUTLIER_DEPTH_THRESHOLD <- 1e-3
+
+# ── Checkpoints ──────────────────────────────────────────────────────────────
+# Occupancy alluvial (Section 1): the three checkpoints used in the thesis
+# figure. Switcher alluvial (Section 6.1): a finer grid.
+OCCUPANCY_CHECKPOINTS <- c(0L, 7L, 14L)
+SWITCHER_CHECKPOINTS  <- c(0L, 3L, 7L, 10L, 14L)
+MIN_TRAJECTORY_FREQ   <- -1      # no filtering of rare sequences
+
+# ── Anchors ──────────────────────────────────────────────────────────────────
+# DAY_TARGET is the clinical decision day requested by the ward. It defines
+# the ONLINE decoding anchor (Section 3) and the first alert window
+# (Section 6). There is no day-7 DEPTH anchor any more.
+DAY_TARGET <- 7L
+
+# ── Outcomes ─────────────────────────────────────────────────────────────────
+#   discharge_dead           — in-hospital death (1) vs discharged alive (0)
+#   discharge_mortality_90d  — death within 90 days of admission_end_date
+OUTCOME_COLS        <- c("discharge_dead", "discharge_mortality_90d")
+TRAJECTORY_OUTCOMES <- c("discharge_dead", "discharge_mortality_90d")
+
+# ── Reference state for every logistic / KM model ────────────────────────────
+# "Stable" is the interpretable baseline and matches the Chapter 3 ordering.
+REF_STATE <- "Stable"
+
+# ── Adjustment set: what the clinician knows at the bedside on day zero ─────
+# Admission-time only. LOS is deliberately EXCLUDED: it is measured after
+# admission and lies on the path from state to death, so conditioning on it
+# induces collider bias. admission_infection is derived from the
+# admission_reason field in Section 4.0 and is therefore not a df_full column.
+ADJUST_COVARS <- c("age", "sex", "Barthel_index", "CIRS_total_score",
+                   "admission_infection")
+
+# ── Analysis plan ────────────────────────────────────────────────────────────
+# One primary analysis is declared in advance; everything else is secondary or
+# sensitivity. In-hospital death is a bounded binary outcome and is modelled by
+# logistic regression. 90-day mortality is a time-to-event outcome and is
+# modelled by Cox regression anchored at ADMISSION, so that in-hospital deaths
+# are events rather than exclusions.
+PRIMARY_ANCHOR   <- "admission"
+BOOT_B           <- 300L    # bootstrap replicates for optimism correction
+BOOT_SEED        <- 20260916L
+
+# ── Death-aware truncation (Section 6.1) ─────────────────────────────────────
+IS_DEAD_COL <- "is_dead"
+
+# ── Survival analysis ────────────────────────────────────────────────────────
+# days_death_from_discharge encoding (stage 2, two-sentinel scheme):
+#   >= 1  → days between admission_end_date and death (event observed)
+#   -1    → alive at end of follow-up (censored)
+#   -2    → died IN-HOSPITAL; post-discharge survival undefined, excluded
+# Time origin of the primary analysis is the DISCHARGE date.
+DATE_OF_DEATH_COL     <- "days_death_from_discharge"
+ADMISSION_DEATH_COL   <- "days_death_from_admission"
+SURVIVAL_FOLLOWUP     <- 90L
+
+# ── Alert system (Section 6) ─────────────────────────────────────────────────
+# Clinically driven: the ward asked for model-based support around day 7.
+# First check at day 7 against baseline (day 0); later checks every two days
+# against the state two days earlier.
+ALERT_CHECK_DAYS <- c( 7L,  9L, 11L, 13L)
+ALERT_PREV_DAYS  <- c( 0L,  7L,  9L, 11L)
+
+# Stratification of alerted patients
+STRAT_CONTINUOUS  <- c("Barthel_index", "Braden_score", "age",
+                       "CIRS_total_score", "length_of_stay_days",
+                       "count_admission_reasons")
+STRAT_CATEGORICAL <- c("sex", "ECOG", "solid_tumor_category",
+                       "discharge_dead", "discharge_mortality_90d",
+                       "admission_infection")
+STRAT_FOCUS       <- c("Barthel_index", "Braden_score", "CIRS_total_score",
+                       "count_admission_reasons")
+STRAT_FOCUS_CAT   <- c("discharge_dead", "admission_infection")
+
+# Multiplicity control across the stratification tests
+P_ADJUST_METHOD <- "BH"
+
+# Permutation negative control for the alert (Section 6.6)
+PERM_B    <- 2000L
+PERM_SEED <- 41703192L
+
+# Admission-reason code marking infection (token-exact match on a
+# pipe-separated field, e.g. "1 | 4 | 10").
+INFECTION_CODE <- "1"
+```
+
+## 0.2 Libraries
+
+```{r libraries}
+library(hmmTMB)
+library(DepthProc)
+library(aplpack)
+library(ggalluvial)
+library(MASS)
+# tidyverse LAST so dplyr::select wins over MASS::select; calls are qualified
+# below anyway.
+library(tidyverse)
+library(patchwork)
+library(broom)
+library(survival)
+library(survminer)
+
+theme_set(theme_bw())
+```
+
+## 0.3 Figure and table export helpers
+
+Every figure and table that Chapter 4 could plausibly use is written to
+disk, so the thesis includes artefacts produced by this run rather than
+screenshots. Naming follows the Chapter 3 convention.
+
+```{r export-helpers}
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TAB_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Save a ggplot / patchwork object as PNG (screen) and PDF (LaTeX).
+save_fig <- function(plot, name, width = 10, height = 6, dpi = 300) {
+  png_path <- file.path(FIG_DIR, paste0(name, ".png"))
+  pdf_path <- file.path(FIG_DIR, paste0(name, ".pdf"))
+  ok <- tryCatch({
+    ggplot2::ggsave(png_path, plot = plot, width = width, height = height,
+                    dpi = dpi, bg = "white")
+    TRUE
+  }, error = function(e) {
+    cat("[figure FAILED] ", name, " (png): ", conditionMessage(e), "\n", sep = "")
+    FALSE
+  })
+  # The PDF is the file LaTeX includes. cairo_pdf gives better font handling
+  # but is not present in every R build, so fall back to the default device.
+  tryCatch(
+    ggplot2::ggsave(pdf_path, plot = plot, width = width, height = height,
+                    device = grDevices::cairo_pdf, bg = "white"),
+    error = function(e)
+      tryCatch(ggplot2::ggsave(pdf_path, plot = plot, width = width,
+                               height = height, bg = "white"),
+               error = function(e2)
+                 cat("[figure FAILED] ", name, " (pdf): ",
+                     conditionMessage(e2), "\n", sep = "")))
+  if (ok) cat("[figure] ", png_path, "\n", sep = "")
+  invisible(ok)
+}
+
+# Save a BASE-GRAPHICS figure (bagplots). `expr` is re-evaluated once per
+# device, so it must be a self-contained drawing expression.
+save_base_fig <- function(expr, name, width = 10, height = 8, res = 300) {
+  e <- substitute(expr)
+  png_path <- file.path(FIG_DIR, paste0(name, ".png"))
+  pdf_path <- file.path(FIG_DIR, paste0(name, ".pdf"))
+  ok <- tryCatch({
+    grDevices::png(png_path, width = width, height = height, units = "in",
+                   res = res, bg = "white")
+    eval(e, envir = parent.frame()); grDevices::dev.off()
+    grDevices::pdf(pdf_path, width = width, height = height, bg = "white")
+    eval(e, envir = parent.frame()); grDevices::dev.off()
+    TRUE
+  }, error = function(err) {
+    while (grDevices::dev.cur() > 1) grDevices::dev.off()
+    cat("[figure FAILED] ", name, ": ", conditionMessage(err), "\n", sep = "")
+    FALSE
+  })
+  if (ok) cat("[figure] ", png_path, "\n", sep = "")
+  invisible(ok)
+}
+
+# ggsurvplot objects are lists, not ggplots: arrange them first so the risk
+# table is kept. Falls back to the curve panel alone if arranging fails.
+save_km_fig <- function(gs, name, width = 10, height = 7, dpi = 300) {
+  obj <- tryCatch(
+    survminer::arrange_ggsurvplots(list(gs), print = FALSE, ncol = 1, nrow = 1),
+    error = function(e) gs$plot)
+  save_fig(obj, name, width = width, height = height, dpi = dpi)
+}
+
+# Save a data frame as CSV and echo it as a kable.
+save_tab <- function(df, name, caption = NULL, digits = 3) {
+  path <- file.path(TAB_DIR, paste0(name, ".csv"))
+  utils::write.csv(df, path, row.names = FALSE)
+  cat("[table] ", path, "\n", sep = "")
+  print(knitr::kable(df, digits = digits, caption = caption, row.names = FALSE))
+  invisible(df)
+}
+```
+
+## 0.4 Load fitted-model bundle
+
+```{r load-bundle}
+bundle   <- readRDS(BUNDLE_PATH)
+
+hmm      <- bundle$hmm
+hmm_data <- bundle$hmm_data
+df_full  <- bundle$df_full
+
+# Hard stop if a legacy bundle still carries a held-out partition: there is no
+# train/test split anywhere in this thesis, and silently ignoring one would
+# leave the cohort sizes inconsistent with Chapters 1 and 3.
+if (!is.null(bundle$test_data) && nrow(bundle$test_data) > 0)
+  stop("Bundle carries a non-empty test_data. Re-run hmm_training_tesi.Rmd ",
+       "with TEST_FRAC = 0; this notebook has no held-out branch.")
+if (!is.null(bundle$test_ids) && length(bundle$test_ids) > 0)
+  stop("Bundle carries test_ids. Re-run the training notebook with TEST_FRAC = 0.")
+
+# ── Compatibility: derive discharge_dead if the bundle predates the rename ───
+if (!"discharge_dead" %in% names(df_full) && "discharged_alive" %in% names(df_full)) {
+  df_full$discharge_dead <- 1L - as.integer(as.character(df_full$discharged_alive))
+  cat("Derived discharge_dead = 1 - discharged_alive.\n")
+}
+
+N_STATES           <- bundle$config$N_STATES
+RESPONSE_VARS      <- bundle$config$RESPONSE_VARS
+RESPONSE_VARS_SAFE <- bundle$config$RESPONSE_VARS_SAFE
+OBS_COVARIATES     <- bundle$config$OBS_COVARIATES
+APPLY_ZSCORE       <- bundle$config$APPLY_ZSCORE
+IS_a_MVN           <- bundle$config$IS_a_MVN
+display_to_safe    <- bundle$name_map$display_to_safe
+safe_to_display    <- bundle$name_map$safe_to_display
+needs_expm1        <- bundle$needs_expm1
+zscore_params      <- bundle$zscore_params
+
+display     <- function(s)  unname(safe_to_display[s])
+display_vec <- function(s)  unname(safe_to_display[s])
+
+# ── Clinical state remap ────────────────────────────────────────────────────
+if (!is.null(bundle$state_remap) && !is.null(bundle$state_levels)) {
+  state_remap     <- bundle$state_remap
+  state_remap_inv <- bundle$state_remap_inv
+  state_levels    <- bundle$state_levels
+  state_colours   <- bundle$state_colours
+} else {
+  state_remap     <- seq_len(N_STATES)
+  state_remap_inv <- seq_len(N_STATES)
+  state_levels    <- paste0("State ", seq_len(N_STATES))
+  state_colours   <- setNames(bundle$state_palette, state_levels)
+}
+pal <- unname(state_colours)
+
+# Reference state used by every model in this notebook.
+if (!REF_STATE %in% state_levels) {
+  warning("REF_STATE '", REF_STATE, "' not among state levels; ",
+          "falling back to '", state_levels[1], "'.")
+  REF_STATE <- state_levels[1]
+}
+
+if (length(OBS_COVARIATES) > 0)
+  warning("Bundled HMM carries observation covariates: ",
+          paste(OBS_COVARIATES, collapse = ", "),
+          ". This notebook is the covariate-free baseline.")
+
+central_label <- if (CENTRAL_FRAC >= 1)
+  "full stayer subpopulation (no central trim)" else
+  paste0("deepest ", round(CENTRAL_FRAC * 100), "% of stayers")
+
+cat("Bundle            :", BUNDLE_PATH, "\n")
+cat("Patients          :", dplyr::n_distinct(hmm_data$ID), "\n")
+cat("Grid days         :", dplyr::n_distinct(hmm_data$time),
+    " (0..", max(hmm_data$time), ")\n", sep = "")
+cat("Total grid values :", nrow(hmm_data), "\n")
+cat("Responses         :", paste(RESPONSE_VARS, collapse = ", "), "\n")
+cat("States            :", N_STATES, " (", paste(state_levels, collapse = ", "),
+    ")\n", sep = "")
+cat("Reference state   :", REF_STATE, "\n")
+cat("Stayer window     : days 0..", STAYER_WINDOW, "\n", sep = "")
+cat("Central cut       :", central_label, "\n")
+```
+
+## 0.5 Back-transform helpers
+
+```{r helpers}
+inv_zscore <- function(z_vals, biomarker_safe) {
+  if (!APPLY_ZSCORE) return(z_vals)
+  row <- zscore_params[zscore_params$biomarker == biomarker_safe, ]
+  z_vals * row$sd + row$mean
+}
+to_clinical <- function(values, biomarker_safe) {
+  v <- inv_zscore(values, biomarker_safe)
+  if (isTRUE(needs_expm1[[biomarker_safe]])) v <- expm1(v)
+  v
+}
+axis_label <- function(biomarker_safe) {
+  disp <- display(biomarker_safe)
+  bits <- character()
+  if (isTRUE(needs_expm1[[biomarker_safe]])) bits <- c(bits, "back-transformed from log1p")
+  if (APPLY_ZSCORE)                          bits <- c(bits, "model on z-scores")
+  if (length(bits) == 0) disp else paste0(disp, " (", paste(bits, collapse = "; "), ")")
+}
+
+# Patient-level view of df_full (which is replicated per day).
+patient_level <- function(cols) {
+  df_full |>
+    dplyr::group_by(ID) |>
+    dplyr::summarise(dplyr::across(dplyr::any_of(cols),
+                                   ~ dplyr::first(stats::na.omit(.x))),
+                     .groups = "drop")
+}
+
+# Token-exact parse of the pipe-separated admission_reason field.
+parse_reasons <- function(s) {
+  toks <- unique(trimws(unlist(strsplit(s, "\\|"))))
+  toks[toks != ""]
+}
+
+# Survival helpers. Defined here rather than inside a gated chunk so that
+# every later section can call them.
+# NOTE: because these two DO embed the data by value, never print a survfit or
+# survdiff object whole — print summary(fit)$table or the components instead,
+# or the knitted document will contain the entire data frame.
+# survminer inspects fit$call$formula, so the call must embed the formula and
+# the data BY VALUE; bquote() does that, reformulate() alone leaves a symbol
+# and surv_pvalue() then fails with "object of type 'symbol' is not
+# subsettable".
+fit_km_one <- function(data, state_col) {
+  form <- stats::reformulate(state_col, response = "survival::Surv(time, event)")
+  eval(bquote(survival::survfit(.(form), data = .(data))))
+}
+run_logrank <- function(data, state_col, tag) {
+  form <- stats::reformulate(state_col, response = "survival::Surv(time, event)")
+  lr <- eval(bquote(survival::survdiff(.(form), data = .(data))))
+  p  <- 1 - stats::pchisq(lr$chisq, df = length(lr$n) - 1)
+  cat("── Log-rank, ", tag, " ──\n", sep = "")
+  print(lr$n)
+  cat("chi-squared = ", round(lr$chisq, 3), " (df = ", length(lr$n) - 1,
+      "), p = ", format.pval(p, digits = 3, eps = 1e-4), "\n\n", sep = "")
+  invisible(tibble::tibble(stratification = tag, chisq = round(lr$chisq, 3),
+                           df = length(lr$n) - 1, p = p))
+}
+```
+
+## 0.6 Outcome integrity checks
+
+Not reported in the thesis. Three consistency checks run before the
+outcomes are used as labels: the two binary outcomes must agree, the
+three groups encoded by the `days_death_from_discharge` sentinels must
+have plausible counts, and the post-discharge time-to-event
+distribution must cover a usable range.
+
+```{r outcome-integrity}
+po <- patient_level(c(OUTCOME_COLS, DATE_OF_DEATH_COL, ADMISSION_DEATH_COL))
+cat("Patients in outcome table: ", nrow(po), "\n\n", sep = "")
+
+if (all(OUTCOME_COLS %in% names(po))) {
+  cat("── discharge_dead x discharge_mortality_90d ──\n")
+  print(table(discharge_dead          = po$discharge_dead,
+              discharge_mortality_90d = po$discharge_mortality_90d,
+              useNA = "ifany"))
+  # An in-hospital death is a death within 90 days by construction.
+  n_anom <- sum(po$discharge_dead == 1 & po$discharge_mortality_90d == 0,
+                na.rm = TRUE)
+  cat("Logically impossible cells (dead in hospital, not dead at 90d): ",
+      n_anom, "\n\n", sep = "")
+}
+
+if (DATE_OF_DEATH_COL %in% names(po)) {
+  d <- po[[DATE_OF_DEATH_COL]]
+  grp <- dplyr::case_when(
+    d == -1L ~ "Alive at follow-up (censored)",
+    d == -2L ~ "Died in-hospital (excluded from post-discharge KM)",
+    d >=  1L ~ "Died post-discharge",
+    TRUE     ~ "Other / anomalous")
+  cat("── Sentinel breakdown ──\n"); print(table(group = grp, useNA = "ifany"))
+  pd <- d[d >= 1L & !is.na(d)]
+  if (length(pd) > 0)
+    cat("\nPost-discharge deaths: n = ", length(pd),
+        "; min/median/max = ", min(pd), " / ", stats::median(pd), " / ",
+        max(pd), " days\n", sep = "")
+}
+```
+
+\newpage
+
+# 1. State-occupancy patterns: stayers and switchers
+
+*Chapter 4, Section 4.1.*
+
+The section that used to open Chapter 3's discussion of occupancy has
+been moved here, because Chapter 4 needs the stayer/switcher split as
+its first definition: the stayers supply the reference subpopulations
+for the depth analysis of Section 2, and the switchers are the
+retrospective counterpart of the alert system of Section 6.
+
+## 1.1 Definition and cohort composition
+
+Let $\hat s_{i0},\dots,\hat s_{i,14}$ be the globally decoded sequence
+of patient $i$ and $\mathcal S_i$ the set of states it visits. Patient
+$i$ is a **stayer** if $|\mathcal S_i| = 1$ and a **switcher**
+otherwise. The window is the whole grid.
+
+```{r occupancy-definition}
+stopifnot(STAYER_WINDOW == 14L)
+
+patient_states <- hmm_data |>
+  dplyr::filter(time <= STAYER_WINDOW) |>
+  dplyr::group_by(ID) |>
+  dplyr::summarise(
+    n_states_visited = dplyr::n_distinct(state),
+    sole_state = if (dplyr::n_distinct(state) == 1)
+                   as.character(state[1]) else NA_character_,
+    pattern    = if (dplyr::n_distinct(state) == 1) "stayer" else "switcher",
+    .groups    = "drop")
+
+n_stayer   <- sum(patient_states$pattern == "stayer")
+n_switcher <- sum(patient_states$pattern == "switcher")
+
+cat("Stayer / switcher split (window = days 0..", STAYER_WINDOW, "):\n", sep = "")
+print(table(patient_states$pattern))
+cat("\nNumber of distinct states visited:\n")
+print(table(patient_states$n_states_visited))
+
+# Cross-check against Chapter 3. A mismatch means the bundle is not the one
+# Chapter 3 was written from.
+if (n_stayer != 887L || n_switcher != 152L)
+  warning("Stayer/switcher split is ", n_stayer, "/", n_switcher,
+          ", not the 887/152 reported in Chapter 3. Verify the bundle.")
+
+tab01 <- patient_states |>
+  dplyr::filter(pattern == "stayer") |>
+  dplyr::count(sole_state, name = "stayers") |>
+  dplyr::mutate(sole_state = factor(sole_state, levels = state_levels)) |>
+  dplyr::arrange(sole_state) |>
+  dplyr::rename(state = sole_state) |>
+  dplyr::mutate(share_of_cohort = round(stayers / nrow(patient_states), 3))
+
+save_tab(tab01, "tab41_01_stayers_by_state",
+         caption = paste0("Stayers by state over days 0..", STAYER_WINDOW,
+                          ". The remaining ", n_switcher,
+                          " patients are switchers."))
+```
+
+```{r occupancy-composition-fig, fig.width=8, fig.height=4}
+p_comp <- tab01 |>
+  ggplot(aes(x = state, y = stayers, fill = state)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = stayers), vjust = -0.4, size = 3.4) +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  labs(title = "Stayers by decoded state",
+       subtitle = paste0("Window = days 0..", STAYER_WINDOW, ". ",
+                         n_stayer, " stayers, ", n_switcher, " switchers, ",
+                         nrow(patient_states), " patients."),
+       x = NULL, y = "Patients") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_comp
+save_fig(p_comp, "fig41_01_stayers_by_state", width = 8, height = 4)
+```
+
+## 1.2 Decoded state at the three checkpoints
+
+```{r occupancy-alluvial, fig.width=10, fig.height=6}
+build_alluvial_df <- function(ids, checkpoints) {
+  hmm_data |>
+    dplyr::filter(ID %in% ids, time %in% checkpoints) |>
+    dplyr::select(ID, time, state) |>
+    dplyr::mutate(time_lbl = factor(paste0("Day ", time),
+                                    levels = paste0("Day ", checkpoints))) |>
+    dplyr::select(-time) |>
+    tidyr::pivot_wider(names_from = time_lbl, values_from = state) |>
+    dplyr::count(!!!rlang::syms(paste0("Day ", checkpoints)), name = "Freq")
+}
+
+plot_alluvial <- function(df, checkpoints, title, subtitle) {
+  axis_args <- setNames(
+    lapply(paste0("Day ", checkpoints), function(c) rlang::sym(c)),
+    paste0("axis", seq_along(checkpoints)))
+  ggplot(df, aes(y = Freq, !!!axis_args)) +
+    geom_alluvium(aes(fill = `Day 0`), alpha = 0.7, width = 1/6) +
+    geom_stratum(width = 1/6, fill = "grey90", colour = "grey40") +
+    geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+    scale_x_discrete(limits = paste0("Day ", checkpoints),
+                     expand = c(0.05, 0.05)) +
+    scale_fill_manual(values = state_colours, name = "State on admission") +
+    labs(title = title, subtitle = subtitle, x = NULL, y = "Number of patients") +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+}
+
+allu_all <- build_alluvial_df(patient_states$ID, OCCUPANCY_CHECKPOINTS)
+p_allu_all <- plot_alluvial(
+  allu_all, OCCUPANCY_CHECKPOINTS,
+  "Decoded state at admission, one week and end of window",
+  paste0("All ", nrow(patient_states),
+         " patients. Ribbon width is proportional to the number of patients."))
+p_allu_all
+save_fig(p_allu_all, "fig41_02_occupancy_alluvial", width = 10, height = 6)
+```
+
+## 1.3 When movement occurs
+
+Chapter 3 asserted, from the alluvial diagram alone, that the movement
+which does occur concentrates in the first interval. This quantifies
+it: the number of patients whose decoded state differs between
+consecutive checkpoints, interval by interval.
+
+```{r switch-timing}
+cp_states <- hmm_data |>
+  dplyr::filter(time %in% OCCUPANCY_CHECKPOINTS) |>
+  dplyr::select(ID, time, state) |>
+  tidyr::pivot_wider(names_from = time, values_from = state,
+                     names_prefix = "d")
+
+interval_tbl <- purrr::map_dfr(
+  seq_len(length(OCCUPANCY_CHECKPOINTS) - 1L), function(k) {
+    a <- paste0("d", OCCUPANCY_CHECKPOINTS[k])
+    b <- paste0("d", OCCUPANCY_CHECKPOINTS[k + 1L])
+    changed <- as.character(cp_states[[a]]) != as.character(cp_states[[b]])
+    tibble::tibble(
+      interval  = paste0("day ", OCCUPANCY_CHECKPOINTS[k], " \u2192 day ",
+                         OCCUPANCY_CHECKPOINTS[k + 1L]),
+      n_patients = sum(!is.na(changed)),
+      n_changed  = sum(changed, na.rm = TRUE),
+      pct        = round(100 * mean(changed, na.rm = TRUE), 2))
+  })
+
+save_tab(interval_tbl, "tab41_02_switch_timing",
+         caption = paste0("Patients whose globally decoded state differs ",
+                          "between consecutive checkpoints."))
+
+# Two-sided test of equality of the two interval proportions (paired on the
+# same patients, so McNemar is the correct test).
+if (nrow(interval_tbl) == 2) {
+  ch1 <- as.character(cp_states$d0) != as.character(cp_states$d7)
+  ch2 <- as.character(cp_states$d7) != as.character(cp_states$d14)
+  mc  <- stats::mcnemar.test(table(first_interval = ch1, second_interval = ch2))
+  cat("\nMcNemar test, early vs late interval:\n"); print(mc)
+}
+```
+
+```{r switch-timing-fig, fig.width=7, fig.height=4}
+p_int <- interval_tbl |>
+  ggplot(aes(x = interval, y = n_changed)) +
+  geom_col(fill = "#c0392b", width = 0.55, alpha = 0.9) +
+  geom_text(aes(label = paste0(n_changed, " (", pct, "%)")),
+            vjust = -0.4, size = 3.4) +
+  labs(title = "Where the state changes happen",
+       subtitle = "Patients with a different decoded state at the two ends of each interval",
+       x = NULL, y = "Patients changing state") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_int
+save_fig(p_int, "fig41_03_switch_timing", width = 7, height = 4)
+```
+
+## 1.4 Emergency-department stabilisation
+
+Chapter 3 offered a clinical reading of the early concentration of
+switches: admission to the ward is preceded by a stay in the emergency
+department, during which the acute derangement is partly corrected, so
+the first ward days record a situation still in motion. That reading is
+a hypothesis; here it is confronted with the ED columns, when present.
+
+```{r er-hypothesis, fig.width=8, fig.height=4}
+er_cols <- intersect(c("days_in_ER", "ER_last_day"), names(df_full))
+
+if (length(er_cols) == 0) {
+  cat("No emergency-department column in df_full ",
+      "(looked for days_in_ER, ER_last_day). Section skipped.\n", sep = "")
+} else {
+  er_pt <- patient_level(er_cols) |>
+    dplyr::inner_join(patient_states |> dplyr::select(ID, pattern), by = "ID")
+
+  # ER_last_day is a Date, days_in_ER a duration in days. They cannot be
+  # stacked into one long column, and only the duration is meaningful on its
+  # own: a calendar date is interpretable only relative to the admission date,
+  # which is not part of this table. Numeric columns are tested and plotted;
+  # anything else is reported and skipped.
+  er_num  <- er_cols[vapply(er_pt[er_cols], is.numeric, logical(1))]
+  er_skip <- setdiff(er_cols, er_num)
+
+  if (length(er_skip) > 0)
+    cat("Non-numeric ED column(s) skipped (",
+        paste(er_skip, collapse = ", "), "): a calendar date carries no ",
+        "exposure information without the admission date.\n\n", sep = "")
+
+  if (length(er_num) == 0) {
+    cat("No numeric ED exposure column available. Section skipped.\n")
+  } else {
+    er_tests <- purrr::map_dfr(er_num, function(v) {
+      x <- er_pt[[v]]; g <- er_pt$pattern
+      tibble::tibble(
+        variable      = v,
+        n_stayer      = sum(g == "stayer"   & !is.na(x)),
+        n_switcher    = sum(g == "switcher" & !is.na(x)),
+        median_stayer = stats::median(x[g == "stayer"],   na.rm = TRUE),
+        median_switch = stats::median(x[g == "switcher"], na.rm = TRUE),
+        p_wilcoxon    = tryCatch(
+          suppressWarnings(stats::wilcox.test(x ~ g)$p.value),
+          error = function(e) NA_real_))
+    })
+    print(as.data.frame(er_tests), digits = 4, row.names = FALSE)
+    save_tab(er_tests, "tab41_03_er_exposure",
+             caption = paste0("Emergency-department exposure by occupancy ",
+                              "pattern. Tests the stabilisation reading of ",
+                              "the early switches."),
+             digits = 4)
+
+    p_er <- er_pt |>
+      dplyr::select(ID, pattern, dplyr::all_of(er_num)) |>
+      tidyr::pivot_longer(dplyr::all_of(er_num),
+                          names_to = "variable", values_to = "value") |>
+      dplyr::filter(!is.na(value)) |>
+      ggplot(aes(x = pattern, y = value, fill = pattern)) +
+      geom_boxplot(width = 0.55, outlier.alpha = 0.3) +
+      facet_wrap(~ variable, scales = "free_y") +
+      scale_fill_manual(values = c(stayer = "grey70", switcher = "#c0392b"),
+                        guide = "none") +
+      labs(title = "Emergency-department exposure by occupancy pattern",
+           subtitle = "Tests the stabilisation reading of the early switches",
+           x = NULL, y = "Days in the emergency department") +
+      theme(plot.title = element_text(face = "bold"),
+            plot.subtitle = element_text(size = 9))
+    print(p_er)
+    save_fig(p_er, "fig41_04_er_exposure", width = 8, height = 4)
+  }
+}
+```
+\newpage
+
+# 2. Admission phenotypes from statistical depth
+
+*Chapter 4, Section 4.2.*
+
+The four stayer subpopulations are the best-identified groups the model
+produces: a stayer occupies one state for the entire admission, so its
+admission vector is an uncontaminated sample from that state's clinical
+profile. Each subpopulation is summarised by its **central core**, and
+every patient in the cohort — stayers and switchers alike — is then
+assigned to the state whose core they are deepest in, using the
+admission vector alone.
+
+The assignment uses $\mathbf{Y}^\star_{i0}$ and nothing else. It is
+therefore a genuinely baseline-only label, unlike the decoded state at
+$t=0$, which under global decoding depends on the patient's whole
+subsequent trajectory. Depth is measured with the **Mahalanobis**
+depth throughout.
+
+## 2.1 Admission matrices of the stayer subpopulations
+
+```{r stayer-matrices}
+day0_stayers <- hmm_data |>
+  dplyr::filter(time == 0) |>
+  dplyr::inner_join(
+    patient_states |>
+      dplyr::filter(!is.na(sole_state)) |>
+      dplyr::select(ID, sole_state),
+    by = "ID") |>
+  dplyr::select(ID, sole_state, dplyr::all_of(RESPONSE_VARS_SAFE))
+
+cat("Stayers per state (admission sample size for depth):\n")
+print(table(factor(day0_stayers$sole_state, levels = state_levels)))
+
+stayer_mats <- split(day0_stayers, factor(day0_stayers$sole_state,
+                                          levels = state_levels)) |>
+  lapply(function(d) as.matrix(d[, RESPONSE_VARS_SAFE, drop = FALSE]))
+```
+
+## 2.2 Central subpopulation and deepest point
+
+Two-step filter. First, drop the formal outliers: a point with
+Mahalanobis depth equal to zero lies outside the convex hull of the
+subpopulation. Second, if `CENTRAL_FRAC < 1`, retain the deepest
+`CENTRAL_FRAC` fraction of what remains.
+
+```{r central-cut}
+central_mats <- lapply(stayer_mats, function(M) {
+  if (nrow(M) < 5) {
+    warning("State with fewer than 5 stayers; depth is unreliable.")
+    return(M)
+  }
+  d <- depth(u = M, X = M, method = "Mahalanobis")
+  M_clean <- M[d > 0, , drop = FALSE]
+  d_clean <- d[d > 0]
+  if (CENTRAL_FRAC < 1) {
+    target_n <- ceiling(nrow(M) * CENTRAL_FRAC)
+    if (nrow(M_clean) > target_n) {
+      ord     <- order(d_clean, decreasing = TRUE)
+      M_clean <- M_clean[ord[seq_len(target_n)], , drop = FALSE]
+    }
+  }
+  M_clean
+})
+
+tab03 <- tibble::tibble(
+  state           = names(stayer_mats),
+  n_stayers       = vapply(stayer_mats,  nrow, integer(1)),
+  n_central       = vapply(central_mats, nrow, integer(1))) |>
+  dplyr::mutate(n_dropped = n_stayers - n_central,
+                state = factor(state, levels = state_levels)) |>
+  dplyr::arrange(state)
+
+save_tab(tab03, "tab42_01_central_populations",
+         caption = paste0("Size of each stayer subpopulation and of its ",
+                          "central core (", central_label, ")."))
+
+# Deepest point (Mahalanobis median) of each central population.
+state_medians <- lapply(central_mats, function(M)
+  depthMedian(M, depth_params = list(method = "Mahalanobis")))
+state_medians_df <- do.call(rbind, state_medians) |> as.data.frame()
+colnames(state_medians_df) <- RESPONSE_VARS
+state_medians_df <- tibble::tibble(state = names(state_medians)) |>
+  dplyr::bind_cols(state_medians_df)
+
+state_medians_clin <- state_medians_df
+for (i in seq_along(RESPONSE_VARS_SAFE))
+  state_medians_clin[[RESPONSE_VARS[i]]] <-
+    to_clinical(state_medians_df[[RESPONSE_VARS[i]]], RESPONSE_VARS_SAFE[i])
+
+save_tab(state_medians_clin, "tab42_02_deepest_points_clinical",
+         caption = paste0("Deepest point of each central population, ",
+                          "clinical scale (", central_label, ")."))
+save_tab(state_medians_df, "tab42_03_deepest_points_model_scale",
+         caption = "Deepest point of each central population, model scale.")
+```
+
+```{r deepest-points-fig, fig.width=9, fig.height=4}
+p_med <- state_medians_clin |>
+  tidyr::pivot_longer(dplyr::all_of(RESPONSE_VARS),
+                      names_to = "biomarker", values_to = "value") |>
+  dplyr::mutate(state = factor(state, levels = state_levels)) |>
+  ggplot(aes(x = state, y = value, fill = state)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.2f", value)), vjust = -0.35, size = 3) +
+  facet_wrap(~ biomarker, scales = "free_y") +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  labs(title = "Deepest point of each admission subpopulation",
+       subtitle = paste0("Clinical units. ", central_label, "."),
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_med
+save_fig(p_med, "fig42_01_deepest_points_clinical", width = 9, height = 4)
+```
+
+## 2.3 Depth distribution per subpopulation
+
+```{r depth-distribution, fig.width=11, fig.height=4}
+depth_long <- do.call(rbind, lapply(names(stayer_mats), function(s) {
+  M <- stayer_mats[[s]]
+  data.frame(state = s, depth = depth(u = M, X = M, method = "Mahalanobis"))
+}))
+depth_long$state <- factor(depth_long$state, levels = state_levels)
+
+thresholds <- do.call(rbind, lapply(names(stayer_mats), function(s) {
+  d <- depth_long$depth[depth_long$state == s]
+  d_pos <- d[d > 0]
+  thr <- if (CENTRAL_FRAC < 1) {
+    target_n <- ceiling(length(d) * CENTRAL_FRAC)
+    if (length(d_pos) > target_n) sort(d_pos, decreasing = TRUE)[target_n]
+    else NA_real_
+  } else NA_real_
+  data.frame(state = factor(s, levels = state_levels), blue_thr = thr)
+}))
+
+p_depth <- ggplot(depth_long, aes(x = depth)) +
+  geom_histogram(bins = 25, fill = "steelblue", colour = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red",
+             linewidth = 0.7) +
+  facet_wrap(~ state, ncol = N_STATES, scales = "free_y") +
+  labs(title = "Mahalanobis depth within each admission subpopulation",
+       subtitle = if (CENTRAL_FRAC < 1)
+         paste0("Red: depth = 0, outside the convex hull. Blue: the ",
+                round(CENTRAL_FRAC * 100), "% central cut.")
+       else "Red: depth = 0, outside the convex hull. No central trim.",
+       x = "Mahalanobis depth", y = "Patients") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+if (any(!is.na(thresholds$blue_thr)))
+  p_depth <- p_depth +
+    geom_vline(data = thresholds[!is.na(thresholds$blue_thr), ],
+               aes(xintercept = blue_thr), linetype = "dashed",
+               colour = "#1a6faf", linewidth = 0.7)
+p_depth
+save_fig(p_depth, "fig42_02_depth_distributions", width = 11, height = 4)
+```
+
+## 2.4 Outlying admission profiles
+
+Patients dropped by the first cut, with their admission biomarkers in
+clinical units, so a clinician can judge whether each is a real anomaly
+or a benign combination the sample size did not cover.
+
+```{r outlier-inspection}
+outlier_inspection <- do.call(rbind, lapply(names(stayer_mats), function(s) {
+  M <- stayer_mats[[s]]
+  d <- depth(u = M, X = M, method = "Mahalanobis")
+  out_idx <- which(d <= 0)
+  if (length(out_idx) == 0) return(NULL)
+  ids <- day0_stayers$ID[day0_stayers$sole_state == s][out_idx]
+  M_out  <- M[out_idx, , drop = FALSE]
+  M_clin <- vapply(seq_along(RESPONSE_VARS_SAFE), function(i)
+    to_clinical(M_out[, i], RESPONSE_VARS_SAFE[i]), numeric(length(out_idx)))
+  colnames(M_clin) <- RESPONSE_VARS
+  data.frame(state = s, patient_id = as.character(ids), round(M_clin, 2),
+             check.names = FALSE)
+}))
+
+if (is.null(outlier_inspection) || nrow(outlier_inspection) == 0) {
+  cat("No depth-0 admission profiles in any subpopulation.\n")
+} else {
+  save_tab(outlier_inspection, "tab42_04_outlying_admission_profiles",
+           caption = paste0("Admission profiles with Mahalanobis depth 0 ",
+                            "within their own subpopulation, clinical scale."))
+}
+```
+
+```{r bagplots, fig.width=10, fig.height=8, results='hide'}
+# Bagplots on the clinical scale, one figure per state. The central
+# population itself is computed on the model scale; back-transformation here
+# is cosmetic.
+stayer_mats_clin <- lapply(stayer_mats, function(M) {
+  M_c <- vapply(seq_along(RESPONSE_VARS_SAFE), function(i)
+    to_clinical(M[, i], RESPONSE_VARS_SAFE[i]), numeric(nrow(M)))
+  colnames(M_c) <- RESPONSE_VARS
+  M_c
+})
+
+p_dim <- length(RESPONSE_VARS_SAFE)
+for (s in names(stayer_mats_clin)) {
+  Mdf <- as.data.frame(stayer_mats_clin[[s]])
+  fname <- paste0("fig42_03_bagplot_", gsub("[^A-Za-z0-9]+", "_", tolower(s)))
+  if (p_dim >= 3) {
+    save_base_fig(aplpack::bagplot.pairs(Mdf, main = s, gap = 0.3),
+                  fname, width = 8, height = 8)
+    aplpack::bagplot.pairs(Mdf, main = s, gap = 0.3)
+  } else if (p_dim == 2) {
+    save_base_fig(aplpack::bagplot(Mdf[[1]], Mdf[[2]],
+                                   xlab = RESPONSE_VARS[1],
+                                   ylab = RESPONSE_VARS[2], main = s),
+                  fname, width = 6, height = 6)
+    aplpack::bagplot(Mdf[[1]], Mdf[[2]], xlab = RESPONSE_VARS[1],
+                     ylab = RESPONSE_VARS[2], main = s)
+  }
+}
+```
+
+## 2.5 Depth-based assignment of the whole cohort
+
+Every patient is assigned to the state whose central population their
+admission vector is deepest in. Patients whose maximum depth across
+states falls below `OUTLIER_DEPTH_THRESHOLD` are flagged as atypical
+and still assigned.
+
+```{r classify-all}
+classify_one <- function(x_row, central_mats) {
+  ds <- vapply(central_mats,
+               function(M) depth(u = matrix(x_row, nrow = 1), X = M,
+                                 method = "Mahalanobis"),
+               numeric(1))
+  list(state = names(which.max(ds)), depths = ds,
+       is_outlier = max(ds) < OUTLIER_DEPTH_THRESHOLD, max_depth = max(ds))
+}
+
+all_day0 <- hmm_data |>
+  dplyr::filter(time == 0) |>
+  dplyr::select(ID, dplyr::all_of(RESPONSE_VARS_SAFE))
+
+cls_all <- lapply(seq_len(nrow(all_day0)), function(k)
+  classify_one(as.numeric(all_day0[k, RESPONSE_VARS_SAFE]), central_mats))
+
+all_day0$depth_state <- factor(vapply(cls_all, `[[`, character(1), "state"),
+                               levels = state_levels)
+all_day0$is_outlier  <- vapply(cls_all, `[[`, logical(1), "is_outlier")
+all_day0$max_depth   <- vapply(cls_all, `[[`, numeric(1), "max_depth")
+
+# Depth with respect to every state, kept for the atypicality analysis.
+depth_matrix_all <- do.call(rbind, lapply(cls_all, `[[`, "depths"))
+colnames(depth_matrix_all) <- names(central_mats)
+all_depths <- dplyr::bind_cols(tibble::tibble(ID = all_day0$ID),
+                               as.data.frame(depth_matrix_all))
+
+cat("Patients assigned: ", nrow(all_day0), "\n", sep = "")
+cat("Flagged atypical (max depth < ", OUTLIER_DEPTH_THRESHOLD, "): ",
+    sum(all_day0$is_outlier), "\n", sep = "")
+
+tab06 <- all_day0 |>
+  dplyr::count(depth_state, name = "patients") |>
+  dplyr::mutate(share = round(patients / nrow(all_day0), 3))
+save_tab(tab06, "tab42_05_phenotype_distribution",
+         caption = "Distribution of the admission phenotype over the cohort.")
+```
+
+```{r admission-phenotype-fig, fig.width=8, fig.height=4}
+p_ph <- ggplot(tab06, aes(x = depth_state, y = patients, fill = depth_state)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(patients, " (", round(100 * share, 1), "%)")),
+            vjust = -0.4, size = 3.3) +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  labs(title = "Admission phenotype of the cohort",
+       subtitle = paste0("Depth-based assignment on the admission vector. n = ",
+                         nrow(all_day0), "."),
+       x = NULL, y = "Patients") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_ph
+save_fig(p_ph, "fig42_04_phenotype_distribution", width = 8, height = 4)
+```
+
+```{r phenotype-profiles-fig, fig.width=10, fig.height=4}
+# Clinical profile of each admission phenotype: what the groups actually look
+# like in native units, on the whole cohort rather than on the stayers only.
+prof <- all_day0 |>
+  dplyr::select(ID, depth_state, dplyr::all_of(RESPONSE_VARS_SAFE))
+for (i in seq_along(RESPONSE_VARS_SAFE))
+  prof[[RESPONSE_VARS[i]]] <- to_clinical(prof[[RESPONSE_VARS_SAFE[i]]],
+                                          RESPONSE_VARS_SAFE[i])
+
+p_prof <- prof |>
+  tidyr::pivot_longer(dplyr::all_of(RESPONSE_VARS),
+                      names_to = "biomarker", values_to = "value") |>
+  ggplot(aes(x = depth_state, y = value, fill = depth_state)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.25) +
+  facet_wrap(~ biomarker, scales = "free_y") +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  labs(title = "Admission biomarkers by admission phenotype",
+       subtitle = "Whole cohort, clinical units.",
+       x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_prof
+save_fig(p_prof, "fig42_05_biomarkers_by_phenotype", width = 10, height = 4)
+
+prof_tbl <- prof |>
+  tidyr::pivot_longer(dplyr::all_of(RESPONSE_VARS),
+                      names_to = "biomarker", values_to = "value") |>
+  dplyr::group_by(depth_state, biomarker) |>
+  dplyr::summarise(median = stats::median(value, na.rm = TRUE),
+                   q25 = stats::quantile(value, 0.25, na.rm = TRUE),
+                   q75 = stats::quantile(value, 0.75, na.rm = TRUE),
+                   .groups = "drop")
+save_tab(prof_tbl, "tab42_06_biomarkers_by_phenotype",
+         caption = "Median and interquartile range of the admission biomarkers by phenotype, clinical units.")
+```
+
+```{r atypicality-fig, fig.width=9, fig.height=4}
+# How firmly each patient sits in the phenotype they were given. A patient
+# whose depth is low with respect to every central population presents
+# atypically and the assignment should be read with that in mind. This is a
+# property depth supplies and a decoded state does not.
+p_atyp <- all_day0 |>
+  ggplot(aes(x = max_depth, fill = depth_state)) +
+  geom_histogram(bins = 30, colour = "white") +
+  facet_wrap(~ depth_state, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  labs(title = "Depth of each patient in the phenotype they were assigned",
+       subtitle = paste0("Maximum depth across the four central populations. ",
+                         sum(all_day0$is_outlier), " patients fall below the ",
+                         "atypicality threshold of ", OUTLIER_DEPTH_THRESHOLD, "."),
+       x = "Maximum Mahalanobis depth", y = "Patients") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_atyp
+save_fig(p_atyp, "fig42_06_admission_typicality", width = 9, height = 4)
+
+# Depth with respect to EVERY state, not just the winner: the margin between
+# the best and the second-best state says how contested the assignment was.
+margin_df <- all_depths |>
+  tidyr::pivot_longer(-ID, names_to = "state", values_to = "depth") |>
+  dplyr::group_by(ID) |>
+  dplyr::arrange(dplyr::desc(depth), .by_group = TRUE) |>
+  dplyr::summarise(best = dplyr::first(state),
+                   d1 = dplyr::nth(depth, 1), d2 = dplyr::nth(depth, 2),
+                   .groups = "drop") |>
+  dplyr::mutate(margin = d1 - d2,
+                best = factor(best, levels = state_levels))
+
+p_margin <- ggplot(margin_df, aes(x = best, y = margin, fill = best)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.25) +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  labs(title = "Margin between the best and second-best phenotype",
+       subtitle = "Small margins mark patients the admission vector does not separate cleanly.",
+       x = NULL, y = "Depth margin") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_margin
+save_fig(p_margin, "fig42_07_assignment_margin", width = 8, height = 4)
+
+save_tab(margin_df |>
+           dplyr::group_by(state = best) |>
+           dplyr::summarise(n = dplyr::n(),
+                            median_margin = round(stats::median(margin), 5),
+                            q25 = round(stats::quantile(margin, 0.25), 5),
+                            q75 = round(stats::quantile(margin, 0.75), 5),
+                            .groups = "drop"),
+         "tab42_07_assignment_margin",
+         caption = "Margin between the deepest and second-deepest state, by assigned phenotype.",
+         digits = 5)
+```
+
+\newpage
+
+# 3. Classification anchors
+
+*Chapter 4, Section 4.3.*
+
+Two anchors are carried forward, and only two. They differ in how much
+of the patient's history they are allowed to see.
+
+| Anchor | Information used |
+|---|---|
+| **admission** | $\mathbf{Y}^\star_{i0}$ alone, via the depth assignment of Section 2 |
+| **day-`r DAY_TARGET` online** | $\mathbf{Y}^\star_{i,0:7}$, via Viterbi on the truncated panel |
+
+The day-`r DAY_TARGET` anchor decodes each patient on the panel
+restricted to days $0,\dots,$ `r DAY_TARGET` and reads the state at the
+final time point. No observation after day `r DAY_TARGET` enters it.
+This is leak-free **in time**; it is not, and must never be described
+as, out-of-sample: the same patients were used to fit the model.
+
+## 3.1 Online decoding
+
+```{r online-decoder}
+# Generalised shadow-HMM online-state builder. Returns one row per patient
+# with the leak-free Viterbi state at `target_day`, restricted to patients
+# alive at that day and with a complete panel up to it.
+# hmmTMB's Viterbi needs at least two time points, so for target_day == 0 we
+# decode days 0..1 and read the day-0 state back.
+death_from_admission <- if (ADMISSION_DEATH_COL %in% names(df_full)) {
+  patient_level(ADMISSION_DEATH_COL) |>
+    dplyr::rename(dth_adm = dplyr::all_of(ADMISSION_DEATH_COL))
+} else {
+  tibble::tibble(ID = unique(hmm_data$ID), dth_adm = NA_integer_)
+}
+
+alive_at <- function(day) {
+  death_from_admission |>
+    dplyr::filter(is.na(dth_adm) | dth_adm == -1L | dth_adm > day) |>
+    dplyr::pull(ID)
+}
+
+# Trained parameters, rebuilt once and reused by every call.
+.obs_par_mat <- hmm$obs()$par(t = 1)[, , 1]
+if (IS_a_MVN) {
+  .pure <- sub("^z\\.", "", rownames(.obs_par_mat))
+  .trained_par <- list(z = setNames(
+    lapply(seq_len(nrow(.obs_par_mat)),
+           function(i) as.numeric(.obs_par_mat[i, ])), .pure))
+  .dists_use <- list(z = "mvnorm")
+} else {
+  .trained_par <- setNames(lapply(RESPONSE_VARS_SAFE, function(b) list(
+    mean = as.numeric(.obs_par_mat[paste0(b, ".mean"), ]),
+    sd   = as.numeric(.obs_par_mat[paste0(b, ".sd"),   ]))), RESPONSE_VARS_SAFE)
+  .dists_use <- setNames(rep(list("norm"), length(RESPONSE_VARS_SAFE)),
+                         RESPONSE_VARS_SAFE)
+}
+.trained_tpm <- hmm$hid()$tpm(t = 1)
+if (length(dim(.trained_tpm)) == 3) .trained_tpm <- .trained_tpm[, , 1]
+.trained_tpm <- .trained_tpm / rowSums(.trained_tpm)
+
+build_online_state <- function(target_day) {
+  decode_upto <- max(1L, as.integer(target_day))
+  ids_alive   <- alive_at(target_day)
+
+  # No column selection: hmmTMB's MVN family needs helper columns created
+  # upstream, and a naive select() would drop them.
+  panel <- hmm_data |>
+    dplyr::filter(time <= decode_upto, ID %in% ids_alive) |>
+    dplyr::arrange(ID, time)
+
+  ok <- panel |> dplyr::count(ID) |>
+    dplyr::filter(n == decode_upto + 1L) |> dplyr::pull(ID)
+  panel <- panel |> dplyr::filter(ID %in% ok)
+
+  if (nrow(panel) == 0)
+    return(tibble::tibble(ID = character(), day = integer(),
+                          state = factor(character(), levels = state_levels)))
+
+  obs_k <- Observation$new(data = panel, dists = .dists_use,
+                           n_states = N_STATES, par = .trained_par)
+  hid_k <- MarkovChain$new(data = panel, n_states = N_STATES,
+                           tpm = .trained_tpm)
+  hmm_k <- HMM$new(obs = obs_k, hid = hid_k, init = hmm)
+
+  panel$state_k <- factor(state_levels[state_remap[hmm_k$viterbi()]],
+                          levels = state_levels)
+  panel |>
+    dplyr::filter(time == target_day) |>
+    dplyr::transmute(ID, day = as.integer(target_day), state = state_k)
+}
+```
+
+## 3.2 The day-`r DAY_TARGET` online state
+
+```{r day7-online}
+online_day7 <- build_online_state(DAY_TARGET) |>
+  dplyr::transmute(ID, online_state = state)
+
+cat("Patients with a day-", DAY_TARGET, " online state: ",
+    nrow(online_day7), " of ", dplyr::n_distinct(hmm_data$ID), "\n", sep = "")
+cat("Excluded because dead on or before day ", DAY_TARGET, ": ",
+    dplyr::n_distinct(hmm_data$ID) - nrow(online_day7), "\n\n", sep = "")
+
+tab08 <- online_day7 |>
+  dplyr::count(online_state, name = "patients") |>
+  dplyr::mutate(share = round(patients / nrow(online_day7), 3))
+save_tab(tab08, "tab43_01_day7_online_distribution",
+         caption = paste0("Distribution of the day-", DAY_TARGET,
+                          " online state."))
+
+# Diagnostic only: how many of these patients had already been discharged by
+# day DAY_TARGET, i.e. how much of the day-7 panel is post-discharge
+# extrapolation rather than observed ward data.
+if ("length_of_stay_days" %in% names(df_full)) {
+  los <- patient_level("length_of_stay_days")
+  disc <- online_day7 |> dplyr::left_join(los, by = "ID") |>
+    dplyr::summarise(
+      n = dplyr::n(),
+      discharged_before_day7 = sum(length_of_stay_days < DAY_TARGET, na.rm = TRUE),
+      pct = round(100 * mean(length_of_stay_days < DAY_TARGET, na.rm = TRUE), 1))
+  cat("Diagnostic — patients already discharged by day ", DAY_TARGET, ":\n", sep = "")
+  print(as.data.frame(disc))
+}
+```
+
+## 3.3 Admission phenotype against the day-`r DAY_TARGET` state
+
+How many patients carry a different label after a week, and in which
+direction. This is the descriptive core of the "what does a week buy
+us" question; the prognostic version of it is Section 4.4.
+
+```{r anchor-crosstab}
+anchor_join <- all_day0 |>
+  dplyr::select(ID, depth_state) |>
+  dplyr::inner_join(online_day7, by = "ID")
+
+ct <- table(admission = anchor_join$depth_state,
+            day7      = anchor_join$online_state)
+cat("Admission phenotype x day-", DAY_TARGET, " online state (n = ",
+    nrow(anchor_join), "):\n", sep = "")
+print(ct)
+cat("\nRow proportions:\n"); print(round(prop.table(ct, margin = 1), 3))
+cat("\nPatients with the same label at both anchors: ",
+    sum(diag(ct)), " (", round(100 * sum(diag(ct)) / sum(ct), 1), "%)\n", sep = "")
+
+ct_df <- as.data.frame(ct)
+names(ct_df) <- c("admission", "day7", "n")
+save_tab(ct_df, "tab43_02_anchor_crosstab",
+         caption = paste0("Admission phenotype against the day-", DAY_TARGET,
+                          " online state."))
+```
+
+```{r anchor-crosstab-fig, fig.width=6.5, fig.height=5.5}
+ct_plot <- ct_df |>
+  dplyr::group_by(admission) |>
+  dplyr::mutate(row_share = n / sum(n)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(admission = factor(admission, levels = state_levels),
+                day7      = factor(day7, levels = rev(state_levels)))
+
+p_ct <- ggplot(ct_plot, aes(x = admission, y = day7, fill = row_share)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(n == 0, "", n)), size = 3.2) +
+  scale_fill_gradient(low = "#eef3f8", high = "#1a6faf", name = "Row share") +
+  labs(title = paste0("From the admission phenotype to the day-", DAY_TARGET,
+                      " state"),
+       subtitle = paste0("Cell label = patients. Fill = share of the admission row. n = ",
+                         nrow(anchor_join), "."),
+       x = "Admission phenotype", y = paste0("Day-", DAY_TARGET, " online state")) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_ct
+save_fig(p_ct, "fig43_01_anchor_crosstab", width = 6.5, height = 5.5)
+```
+
+```{r anchor-shares-fig, fig.width=8, fig.height=4}
+shares <- dplyr::bind_rows(
+  tab06 |> dplyr::transmute(anchor = "admission",
+                            state = depth_state, share),
+  tab08 |> dplyr::transmute(anchor = paste0("day ", DAY_TARGET, " online"),
+                            state = online_state, share))
+
+p_sh <- ggplot(shares, aes(x = state, y = share, fill = state, alpha = anchor)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  scale_alpha_manual(values = c(1, 0.5), name = NULL) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "State composition at the two anchors",
+       subtitle = "Cohorts differ: the day-7 anchor excludes patients who died in the first week.",
+       x = NULL, y = "Share of the anchor cohort") +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_sh
+save_fig(p_sh, "fig43_02_anchor_state_shares", width = 8, height = 4)
+```
+
+\newpage
+
+```{r section4-header, echo=FALSE, results='asis'}
+cat("\n\\newpage\n")
+```
+
+# 4. In-hospital mortality
+
+*Chapter 4, Section 4.4.*
+
+In-hospital death is a bounded binary outcome and is modelled by logistic
+regression. 90-day mortality is a time-to-event outcome and is deferred to
+Section 5.
+
+The question is not whether the phenotype predicts death well. It is whether
+states estimated from three biomarkers, with no access to outcomes, no
+covariates and no supervision, separate patients by mortality at all, and
+whether that separation survives adjustment for what the clinician already
+knows at the bedside.
+
+## 4.0 Covariate table and adjustment set
+
+```{r covariate-table}
+# admission_reason is a pipe-separated field, e.g. "1 | 4 | 10". The match is
+# on the exact TOKEN, so "10" and "11" are not read as infection.
+base_covars <- intersect(
+  c("age", "sex", "Barthel_index", "CIRS_total_score", "Braden_score",
+    "ECOG", "length_of_stay_days", "admission_reason"),
+  names(df_full))
+
+covariates_pt <- patient_level(c(base_covars, OUTCOME_COLS))
+
+if ("admission_reason" %in% names(covariates_pt)) {
+  .ar <- as.character(covariates_pt$admission_reason)
+  covariates_pt$admission_infection <- vapply(.ar, function(s)
+    if (is.na(s)) NA_integer_ else as.integer(INFECTION_CODE %in% parse_reasons(s)),
+    integer(1), USE.NAMES = FALSE)
+  covariates_pt$count_admission_reasons <- vapply(.ar, function(s)
+    if (is.na(s)) NA_integer_ else length(parse_reasons(s)),
+    integer(1), USE.NAMES = FALSE)
+}
+
+# sex as a factor with an explicit reference, so the coefficient name is stable
+if ("sex" %in% names(covariates_pt))
+  covariates_pt$sex <- factor(as.character(covariates_pt$sex))
+
+ADJUST_USE <- intersect(ADJUST_COVARS, names(covariates_pt))
+missing_adj <- setdiff(ADJUST_COVARS, ADJUST_USE)
+if (length(missing_adj) > 0)
+  warning("Adjustment covariates not found and dropped: ",
+          paste(missing_adj, collapse = ", "))
+
+cat("Adjustment set in use: ", paste(ADJUST_USE, collapse = ", "), "\n\n", sep = "")
+
+# Completeness of the adjustment set. Complete-case analysis is only defensible
+# if the loss is small; this prints the loss before anything is fitted.
+avail <- tibble::tibble(
+  covariate = ADJUST_USE,
+  n_missing = vapply(ADJUST_USE, function(v) sum(is.na(covariates_pt[[v]])),
+                     integer(1)),
+  pct_missing = round(100 * vapply(ADJUST_USE, function(v)
+    mean(is.na(covariates_pt[[v]])), numeric(1)), 2))
+n_complete <- sum(stats::complete.cases(covariates_pt[, ADJUST_USE, drop = FALSE]))
+avail <- dplyr::bind_rows(avail, tibble::tibble(
+  covariate = "ALL (complete cases)",
+  n_missing = nrow(covariates_pt) - n_complete,
+  pct_missing = round(100 * (1 - n_complete / nrow(covariates_pt)), 2)))
+
+save_tab(avail, "tab44_01_covariate_availability",
+         caption = paste0("Missingness in the adjustment set over the ",
+                          nrow(covariates_pt), " patients of the cohort."))
+
+# Descriptive summary of the adjustment set, for the chapter's covariate table.
+desc <- purrr::map_dfr(ADJUST_USE, function(v) {
+  x <- covariates_pt[[v]]
+  if (is.numeric(x) && dplyr::n_distinct(stats::na.omit(x)) > 2)
+    tibble::tibble(covariate = v, type = "continuous",
+                   summary = sprintf("%.1f [%.1f, %.1f]",
+                                     stats::median(x, na.rm = TRUE),
+                                     stats::quantile(x, .25, na.rm = TRUE),
+                                     stats::quantile(x, .75, na.rm = TRUE)))
+  else
+    tibble::tibble(covariate = v, type = "binary / factor",
+                   summary = paste(names(table(x)), as.integer(table(x)),
+                                   sep = ": ", collapse = "; "))
+})
+save_tab(desc, "tab44_02_covariate_summary",
+         caption = "Adjustment covariates: median [IQR] or counts by level.")
+```
+
+```{r collinearity-check, fig.width=6, fig.height=5}
+# CIRS and Barthel both index burden of illness and could be collinear, which
+# would inflate the standard errors of BOTH and make the adjusted phenotype
+# effect look more stable than it is. Checked before use, not after.
+num_adj <- ADJUST_USE[vapply(covariates_pt[ADJUST_USE], function(x)
+  is.numeric(x) && dplyr::n_distinct(stats::na.omit(x)) > 2, logical(1))]
+
+if (length(num_adj) >= 2) {
+  cmat <- stats::cor(covariates_pt[, num_adj, drop = FALSE],
+                     use = "pairwise.complete.obs")
+  cat("Pairwise correlation among the continuous adjusters:\n")
+  print(round(cmat, 3))
+
+  # Variance inflation: each continuous adjuster regressed on the others.
+  vif_tbl <- purrr::map_dfr(num_adj, function(v) {
+    others <- setdiff(num_adj, v)
+    if (length(others) == 0) return(NULL)
+    r2 <- summary(stats::lm(stats::reformulate(others, response = v),
+                            data = covariates_pt))$r.squared
+    tibble::tibble(covariate = v, R2_on_others = round(r2, 4),
+                   VIF = round(1 / (1 - r2), 3))
+  })
+  save_tab(vif_tbl, "tab44_03_collinearity",
+           caption = "Variance inflation among the continuous adjustment covariates.")
+
+  cl <- as.data.frame(as.table(cmat)); names(cl) <- c("v1", "v2", "r")
+  p_cl <- ggplot(cl, aes(v1, v2, fill = r)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+    scale_fill_gradient2(low = "#1a6faf", mid = "white", high = "#c0392b",
+                         midpoint = 0, limits = c(-1, 1), name = "r") +
+    labs(title = "Correlation among the adjustment covariates",
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 25, hjust = 1),
+          plot.title = element_text(face = "bold"))
+  print(p_cl)
+  save_fig(p_cl, "fig44_01_covariate_correlation", width = 6, height = 5)
+}
+```
+
+## 4.1 Model datasets
+
+```{r model-datasets}
+as_binary <- function(y) {
+  if (is.factor(y))         as.integer(y) - 1L
+  else if (is.logical(y))   as.integer(y)
+  else if (is.character(y)) as.integer(y %in% c("1", "TRUE"))
+  else                      as.integer(y)
+}
+
+model_admission <- all_day0 |>
+  dplyr::select(ID, state = depth_state, max_depth) |>
+  dplyr::inner_join(covariates_pt, by = "ID") |>
+  dplyr::mutate(state = stats::relevel(droplevels(state), ref = REF_STATE),
+                anchor = "admission")
+
+model_day7 <- online_day7 |>
+  dplyr::select(ID, state = online_state) |>
+  dplyr::inner_join(covariates_pt, by = "ID") |>
+  dplyr::mutate(state = stats::relevel(droplevels(state), ref = REF_STATE),
+                anchor = paste0("day", DAY_TARGET, "_online"))
+
+anchor_defs <- list(
+  list(key = "admission",                        data = model_admission),
+  list(key = paste0("day", DAY_TARGET, "_online"), data = model_day7))
+
+common_ids  <- intersect(model_admission$ID, model_day7$ID)
+common_data <- model_admission |>
+  dplyr::filter(ID %in% common_ids) |>
+  dplyr::rename(state_admission = state) |>
+  dplyr::select(-anchor) |>
+  dplyr::inner_join(model_day7 |> dplyr::select(ID, state_day7 = state),
+                    by = "ID") |>
+  dplyr::mutate(
+    state_admission = stats::relevel(droplevels(state_admission), ref = REF_STATE),
+    state_day7      = stats::relevel(droplevels(state_day7),      ref = REF_STATE))
+
+cat("Admission anchor : ", nrow(model_admission), " patients\n", sep = "")
+cat("Day-", DAY_TARGET, " anchor      : ", nrow(model_day7), " patients\n", sep = "")
+cat("Common subcohort : ", length(common_ids), " patients\n\n", sep = "")
+```
+
+```{r event-counts}
+OUTCOME_LOGIT <- "discharge_dead"
+
+event_counts <- purrr::map_dfr(anchor_defs, function(ad) {
+  ad$data |>
+    dplyr::mutate(.y = as_binary(.data[[OUTCOME_LOGIT]])) |>
+    dplyr::filter(!is.na(.y)) |>
+    dplyr::group_by(state) |>
+    dplyr::summarise(n = dplyr::n(), events = sum(.y), .groups = "drop") |>
+    dplyr::mutate(anchor = ad$key)
+}) |>
+  dplyr::mutate(rate = round(events / n, 4)) |>
+  dplyr::select(anchor, state, n, events, rate)
+
+save_tab(event_counts, "tab44_04_event_counts",
+         caption = "In-hospital deaths by state and anchor.")
+
+thin <- event_counts |> dplyr::filter(events < 5)
+if (nrow(thin) > 0) {
+  cat("\nWARNING — cells with fewer than 5 events:\n"); print(as.data.frame(thin))
+}
+
+# Events per variable for the adjusted model: below about 10 the odds ratios
+# are unstable and must be presented as such.
+n_par_adj <- (nlevels(model_admission$state) - 1) +
+  sum(vapply(ADJUST_USE, function(v)
+    if (is.factor(covariates_pt[[v]])) nlevels(covariates_pt[[v]]) - 1 else 1,
+    numeric(1)))
+cat("\nAdjusted model: ", n_par_adj, " parameters besides the intercept; ",
+    sum(event_counts$events[event_counts$anchor == "admission"]),
+    " events; EPV = ",
+    round(sum(event_counts$events[event_counts$anchor == "admission"]) / n_par_adj, 2),
+    "\n", sep = "")
+```
+
+## 4.2 Absolute risk by phenotype
+
+```{r absolute-risk, fig.width=9, fig.height=4.5}
+# Wilson score interval: appropriate for proportions near the boundary, unlike
+# the Wald interval.
+wilson_ci <- function(x, n, conf = 0.95) {
+  if (n == 0) return(c(NA, NA))
+  z <- stats::qnorm(1 - (1 - conf) / 2)
+  p <- x / n; d <- 1 + z^2 / n
+  c(lower = (p + z^2 / (2 * n) - z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))) / d,
+    upper = (p + z^2 / (2 * n) + z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2))) / d)
+}
+
+risk_tbl <- event_counts |>
+  dplyr::rowwise() |>
+  dplyr::mutate(ci = list(wilson_ci(events, n)),
+                lower = round(ci[[1]], 4), upper = round(ci[[2]], 4)) |>
+  dplyr::ungroup() |>
+  dplyr::select(anchor, state, n, events, rate, lower, upper)
+
+save_tab(risk_tbl, "tab44_05_absolute_risk",
+         caption = "In-hospital mortality by state and anchor, with 95% Wilson intervals.")
+
+p_risk <- risk_tbl |>
+  dplyr::mutate(state = factor(state, levels = state_levels)) |>
+  ggplot(aes(x = state, y = rate, fill = state)) +
+  geom_col(width = 0.65) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.18, linewidth = 0.5) +
+  geom_text(aes(label = paste0(events, "/", n), y = upper),
+            vjust = -0.6, size = 2.9) +
+  facet_wrap(~ anchor) +
+  scale_fill_manual(values = state_colours, guide = "none") +
+  scale_y_continuous(labels = scales::percent,
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(title = "In-hospital mortality by state",
+       subtitle = "95% Wilson intervals. Label = deaths / patients.",
+       x = NULL, y = "Observed risk") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_risk
+save_fig(p_risk, "fig44_02_absolute_risk", width = 9, height = 4.5)
+```
+
+## 4.3 Does the phenotype add to bedside information?
+
+The central comparison of this section. $M_0$ contains only what the clinician
+has without the model; $M_1$ adds the phenotype. The likelihood-ratio test of
+$M_0$ against $M_1$ is the question "is the latent state worth anything on top
+of age, sex, function, comorbidity burden and reason for admission".
+
+```{r logistic-nested-helpers}
+auc_fn <- function(y, p) {
+  y <- as.integer(y); ok <- !is.na(y) & !is.na(p); y <- y[ok]; p <- p[ok]
+  n1 <- sum(y == 1); n0 <- sum(y == 0)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  r <- rank(p); (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+brier_fn <- function(y, p) mean((p - as.integer(y))^2, na.rm = TRUE)
+
+# Apparent AUC is optimistic because the model was fitted on the same rows.
+# Harrell's bootstrap optimism correction quantifies and removes that bias.
+optimism_auc <- function(form, data, B = BOOT_B) {
+  fit <- stats::glm(form, data = data, family = stats::binomial())
+  y   <- data$.y
+  app <- auc_fn(y, stats::predict(fit, type = "response"))
+  opt <- rep(NA_real_, B)
+  for (b in seq_len(B)) {
+    idx <- sample.int(nrow(data), nrow(data), replace = TRUE)
+    fb <- tryCatch(suppressWarnings(
+      stats::glm(form, data = data[idx, , drop = FALSE],
+                 family = stats::binomial())), error = function(e) NULL)
+    if (is.null(fb)) next
+    a_boot <- auc_fn(y[idx], stats::predict(fb, type = "response"))
+    a_orig <- auc_fn(y, stats::predict(fb, newdata = data, type = "response"))
+    opt[b] <- a_boot - a_orig
+  }
+  o <- mean(opt, na.rm = TRUE)
+  c(apparent = app, optimism = o, corrected = app - o,
+    B_used = sum(!is.na(opt)))
+}
+
+# Build the complete-case frame shared by M0 and M1 so the two are nested on
+# identical rows; otherwise the LRT is invalid.
+build_frame <- function(data, outcome, state_col = "state",
+                        adjust = ADJUST_USE) {
+  d <- data
+  d$.y <- as_binary(d[[outcome]])
+  keep <- stats::complete.cases(d[, c(".y", state_col, adjust), drop = FALSE])
+  d[keep, , drop = FALSE]
+}
+```
+
+```{r logistic-nested}
+set.seed(BOOT_SEED)
+
+nested_rows <- list(); nested_fits <- list()
+
+for (ad in anchor_defs) {
+  d <- build_frame(ad$data, OUTCOME_LOGIT)
+  cat("\n=========================================================\n")
+  cat("Anchor: ", ad$key, " | outcome: ", OUTCOME_LOGIT,
+      " | complete cases: ", nrow(d), " (events ", sum(d$.y), ")\n", sep = "")
+  cat("=========================================================\n")
+
+  f_null  <- stats::glm(.y ~ 1, data = d, family = stats::binomial())
+  f_state <- stats::glm(stats::reformulate("state", response = ".y"),
+                        data = d, family = stats::binomial())
+  f_M0    <- stats::glm(stats::reformulate(ADJUST_USE, response = ".y"),
+                        data = d, family = stats::binomial())
+  f_M1    <- stats::glm(stats::reformulate(c("state", ADJUST_USE), response = ".y"),
+                        data = d, family = stats::binomial())
+
+  nested_fits[[ad$key]] <- list(data = d, state = f_state, M0 = f_M0, M1 = f_M1)
+
+  cat("\n--- M0: covariates only ---\n");            print(summary(f_M0))
+  cat("\n--- M1: covariates + phenotype ---\n");     print(summary(f_M1))
+
+  lrt <- stats::anova(f_M0, f_M1, test = "LRT")
+  cat("\nLikelihood-ratio test, M0 vs M1:\n"); print(lrt)
+
+  # Does the phenotype alone beat the covariates alone? Non-nested, so AIC only.
+  for (nm in c("state only", "M0", "M1")) {
+    fit <- switch(nm, "state only" = f_state, "M0" = f_M0, "M1" = f_M1)
+    oa  <- optimism_auc(stats::formula(fit), d)
+    nested_rows[[length(nested_rows) + 1L]] <- tibble::tibble(
+      anchor = ad$key, model = nm,
+      n = nrow(d), events = sum(d$.y),
+      df = length(stats::coef(fit)) - 1,
+      AIC = round(stats::AIC(fit), 2), BIC = round(stats::BIC(fit), 2),
+      AUC_apparent  = round(oa[["apparent"]], 4),
+      AUC_corrected = round(oa[["corrected"]], 4),
+      Brier = round(brier_fn(d$.y, stats::predict(fit, type = "response")), 5),
+      LRT_vs_M0_df = if (nm == "M1") lrt$Df[2] else NA_integer_,
+      LRT_vs_M0_p  = if (nm == "M1") lrt[["Pr(>Chi)"]][2] else NA_real_)
+  }
+}
+
+nested_tbl <- dplyr::bind_rows(nested_rows)
+save_tab(nested_tbl, "tab44_06_nested_models",
+         caption = paste0("Nested logistic models for in-hospital death. ",
+                          "AUC_corrected is bootstrap optimism-corrected (B = ",
+                          BOOT_B, ")."),
+         digits = 5)
+```
+
+```{r logistic-nested-fig, fig.width=8, fig.height=4}
+p_nest <- nested_tbl |>
+  dplyr::mutate(model = factor(model, levels = c("state only", "M0", "M1"))) |>
+  tidyr::pivot_longer(c(AUC_apparent, AUC_corrected),
+                      names_to = "kind", values_to = "auc") |>
+  ggplot(aes(x = model, y = auc, fill = kind)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.62) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "grey50") +
+  geom_text(aes(label = sprintf("%.3f", auc)),
+            position = position_dodge(width = 0.72), vjust = -0.35, size = 2.8) +
+  facet_wrap(~ anchor) +
+  scale_fill_manual(values = c(AUC_apparent = "#9dbdd8",
+                               AUC_corrected = "#1a6faf"), name = NULL) +
+  coord_cartesian(ylim = c(0.45, 0.85)) +
+  labs(title = "Discrimination of the nested models, in-hospital death",
+       subtitle = "M0 = covariates only; M1 = covariates + phenotype.",
+       x = NULL, y = "AUC") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_nest
+save_fig(p_nest, "fig44_03_nested_auc", width = 8, height = 4)
+```
+
+## 4.4 Odds ratios, crude and adjusted
+
+```{r logistic-or}
+plot_forest <- function(td, title, subtitle, xlab = "Odds ratio (log scale)") {
+  td <- td |> dplyr::mutate(term = factor(term, levels = rev(unique(term))))
+  ggplot(td, aes(x = estimate, y = term)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "red") +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high,
+                       colour = ifelse(cross_one, "crosses 1", "does not cross 1")),
+                   height = 0.2, linewidth = 0.6) +
+    geom_point(aes(colour = ifelse(cross_one, "crosses 1", "does not cross 1")),
+               size = 2.8) +
+    scale_colour_manual(values = c("crosses 1" = "grey70",
+                                   "does not cross 1" = "#1a6faf"), name = NULL) +
+    scale_x_log10() +
+    facet_grid(model ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    labs(title = title, subtitle = subtitle, x = xlab, y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom", strip.placement = "outside",
+          strip.text.y.left = element_text(face = "bold", angle = 0, hjust = 1),
+          strip.background = element_rect(fill = "grey95", colour = NA),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+}
+
+or_rows <- list()
+for (ad in anchor_defs) {
+  fits <- nested_fits[[ad$key]]
+  for (nm in c("crude", "adjusted")) {
+    fit <- if (nm == "crude") fits$state else fits$M1
+    td <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) |>
+      dplyr::filter(term != "(Intercept)") |>
+      dplyr::mutate(term = sub("^state", "", term),
+                    anchor = ad$key, model = nm,
+                    cross_one = conf.low <= 1 & conf.high >= 1,
+                    n = nrow(fits$data), events = sum(fits$data$.y))
+    or_rows[[length(or_rows) + 1L]] <- td
+  }
+}
+or_table <- dplyr::bind_rows(or_rows) |>
+  dplyr::select(anchor, model, term, estimate, conf.low, conf.high, p.value,
+                n, events, cross_one)
+
+save_tab(or_table |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                                 ~ round(.x, 4))),
+         "tab44_07_odds_ratios",
+         caption = paste0("Odds ratios for in-hospital death. Crude = state ",
+                          "only; adjusted = state + ",
+                          paste(ADJUST_USE, collapse = ", "),
+                          ". Reference state: ", REF_STATE, "."))
+
+# The confounding structure itself is a result: how each odds ratio moves when
+# the covariates are added.
+shift_tbl <- or_table |>
+  dplyr::filter(term %in% state_levels) |>
+  dplyr::select(anchor, term, model, estimate) |>
+  tidyr::pivot_wider(names_from = model, values_from = estimate) |>
+  dplyr::mutate(pct_change = round(100 * (adjusted - crude) / crude, 1),
+                direction = ifelse(adjusted > crude,
+                                   "strengthens under adjustment",
+                                   "attenuates under adjustment"))
+save_tab(shift_tbl, "tab44_08_confounding_shift",
+         caption = "Movement of each odds ratio when the adjustment set is added.")
+```
+
+```{r logistic-forests, fig.width=9, fig.height=6}
+for (ad in anchor_defs) {
+  td <- or_table |> dplyr::filter(anchor == ad$key, term %in% state_levels)
+  if (nrow(td) == 0) next
+  g <- plot_forest(td, paste0("In-hospital death — ", ad$key, " anchor"),
+                   paste0("Reference: ", REF_STATE, ". Adjusted for ",
+                          paste(ADJUST_USE, collapse = ", "), "."))
+  print(g); save_fig(g, paste0("fig44_04_forest_", ad$key),
+                     width = 9, height = 6)
+}
+
+td_adj <- or_table |>
+  dplyr::filter(model == "adjusted", !term %in% state_levels) |>
+  dplyr::mutate(model = anchor)
+if (nrow(td_adj) > 0) {
+  g_adj <- plot_forest(td_adj, "Adjustment covariates, in-hospital death",
+                       "State terms omitted; same models as above.")
+  print(g_adj); save_fig(g_adj, "fig44_05_forest_adjusters",
+                         width = 9, height = 5)
+}
+```
+
+## 4.5 Anchor comparison on the common subcohort
+
+```{r logistic-anchor-comparison}
+cd <- common_data
+cd$.y <- as_binary(cd[[OUTCOME_LOGIT]])
+cd <- cd[stats::complete.cases(cd[, c(".y", "state_admission", "state_day7",
+                                      ADJUST_USE), drop = FALSE]), ]
+cat("Common subcohort, complete cases: ", nrow(cd),
+    " (events ", sum(cd$.y), ")\n\n", sep = "")
+
+cmp_fits <- list(
+  admission = stats::glm(stats::reformulate(c("state_admission", ADJUST_USE),
+                                            response = ".y"),
+                         data = cd, family = stats::binomial()),
+  day7      = stats::glm(stats::reformulate(c("state_day7", ADJUST_USE),
+                                            response = ".y"),
+                         data = cd, family = stats::binomial()),
+  both      = stats::glm(stats::reformulate(c("state_admission", "state_day7",
+                                              ADJUST_USE), response = ".y"),
+                         data = cd, family = stats::binomial()),
+  M0        = stats::glm(stats::reformulate(ADJUST_USE, response = ".y"),
+                         data = cd, family = stats::binomial()))
+
+cmp_tbl <- purrr::imap_dfr(cmp_fits, function(fit, nm) {
+  oa <- optimism_auc(stats::formula(fit), cd)
+  tibble::tibble(model = nm, n = nrow(cd), events = sum(cd$.y),
+                 df = length(stats::coef(fit)) - 1,
+                 AIC = round(stats::AIC(fit), 2),
+                 BIC = round(stats::BIC(fit), 2),
+                 AUC_apparent = round(oa[["apparent"]], 4),
+                 AUC_corrected = round(oa[["corrected"]], 4),
+                 Brier = round(brier_fn(cd$.y,
+                   stats::predict(fit, type = "response")), 5))
+})
+save_tab(cmp_tbl, "tab44_09_anchor_comparison",
+         caption = paste0("Anchor comparison for in-hospital death on the ",
+                          "common subcohort (n = ", nrow(cd), ")."))
+
+lrt_tbl <- dplyr::bind_rows(
+  {a <- stats::anova(cmp_fits$admission, cmp_fits$both, test = "LRT")
+   tibble::tibble(comparison = "admission -> + day-7 state",
+                  df = a$Df[2], deviance = round(a$Deviance[2], 3),
+                  p = a[["Pr(>Chi)"]][2])},
+  {a <- stats::anova(cmp_fits$day7, cmp_fits$both, test = "LRT")
+   tibble::tibble(comparison = "day-7 -> + admission phenotype",
+                  df = a$Df[2], deviance = round(a$Deviance[2], 3),
+                  p = a[["Pr(>Chi)"]][2])})
+cat("Incremental contribution of each anchor:\n"); print(as.data.frame(lrt_tbl))
+save_tab(lrt_tbl, "tab44_10_anchor_lrt",
+         caption = "Likelihood-ratio tests for the incremental contribution of each anchor, in-hospital death.",
+         digits = 5)
+```
+
+## 4.6 Model diagnostics
+
+```{r logistic-diagnostics, fig.width=9, fig.height=4}
+# Separation, influence and calibration for the primary model.
+prim <- nested_fits[[PRIMARY_ANCHOR]]
+fit  <- prim$M1; d <- prim$data
+
+cat("Largest |coefficient| in the primary adjusted model: ",
+    round(max(abs(stats::coef(fit)[-1])), 3),
+    "  (values above ~10 indicate separation)\n", sep = "")
+cat("Largest standard error: ",
+    round(max(summary(fit)$coefficients[-1, 2]), 3), "\n\n", sep = "")
+
+infl <- stats::influence.measures(fit)
+cat("Observations flagged influential by at least one measure: ",
+    sum(apply(infl$is.inf, 1, any)), " of ", nrow(d), "\n", sep = "")
+cd_cook <- stats::cooks.distance(fit)
+cat("Max Cook's distance: ", round(max(cd_cook, na.rm = TRUE), 4), "\n\n", sep = "")
+
+# Calibration by decile of predicted risk.
+pr <- stats::predict(fit, type = "response")
+dec <- cut(pr, breaks = stats::quantile(pr, seq(0, 1, 0.1)),
+           include.lowest = TRUE, labels = FALSE)
+calib <- tibble::tibble(decile = dec, obs = d$.y, pred = pr) |>
+  dplyr::group_by(decile) |>
+  dplyr::summarise(n = dplyr::n(), predicted = mean(pred),
+                   observed = mean(obs), .groups = "drop")
+save_tab(calib, "tab44_11_calibration",
+         caption = "Calibration of the primary adjusted model by decile of predicted risk.",
+         digits = 4)
+
+p_cal <- ggplot(calib, aes(predicted, observed)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 2.6, colour = "#1a6faf") +
+  geom_line(colour = "#1a6faf", alpha = 0.6) +
+  labs(title = "Calibration, in-hospital death",
+       subtitle = paste0("Primary adjusted model, ", PRIMARY_ANCHOR,
+                         " anchor. Deciles of predicted risk."),
+       x = "Predicted risk", y = "Observed risk") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_cal
+save_fig(p_cal, "fig44_06_calibration", width = 6, height = 5)
+```
+
+```{r section5-header, echo=FALSE, results='asis'}
+cat("\n\\newpage\n")
+```
+
+# 5. 90-day mortality
+
+*Chapter 4, Section 4.5.*
+
+90-day mortality is a time-to-event outcome and is modelled by Cox regression.
+The primary analysis is anchored at **admission**, with every death within 90
+days treated as an event, in-hospital deaths included. Anchoring at discharge
+instead would condition on surviving to discharge, which removes precisely the
+patients the phenotype identifies best; that analysis is retained in
+Section 5.6 as a secondary one.
+
+## 5.1 Survival datasets
+
+```{r cox-build}
+death_adm <- patient_level(ADMISSION_DEATH_COL) |>
+  dplyr::rename(days_to_death = dplyr::all_of(ADMISSION_DEATH_COL))
+
+cat("Sentinel breakdown, ", ADMISSION_DEATH_COL, ":\n", sep = "")
+print(table(group = dplyr::case_when(
+  death_adm$days_to_death == -1L ~ "alive at end of follow-up (censored)",
+  death_adm$days_to_death >=  0L ~ "died, day recorded",
+  TRUE                           ~ "other / anomalous"), useNA = "ifany"))
+
+build_cox <- function(data, state_col = "state") {
+  out <- data |>
+    dplyr::inner_join(death_adm, by = "ID") |>
+    dplyr::mutate(
+      .event = as.integer(!is.na(days_to_death) & days_to_death >= 0L &
+                          days_to_death <= SURVIVAL_FOLLOWUP),
+      # a death recorded on day 0 would give a zero survival time, which coxph
+      # drops; half a day keeps the event in the risk set calculation
+      .time  = ifelse(.event == 1, pmax(as.numeric(days_to_death), 0.5),
+                      as.numeric(SURVIVAL_FOLLOWUP)))
+  out[[state_col]] <- stats::relevel(droplevels(out[[state_col]]), ref = REF_STATE)
+  out
+}
+
+cox_admission <- build_cox(model_admission)
+cox_day7      <- build_cox(model_day7)
+cox_anchors   <- list(admission = cox_admission,
+                      day7      = cox_day7)
+names(cox_anchors)[2] <- paste0("day", DAY_TARGET, "_online")
+
+for (nm in names(cox_anchors)) {
+  d <- cox_anchors[[nm]]
+  cat("\n", nm, ": n = ", nrow(d), ", events = ", sum(d$.event),
+      ", median follow-up = ", round(stats::median(d$.time), 1), " days\n", sep = "")
+  print(table(state = d[[ "state" ]], event = d$.event))
+}
+```
+
+## 5.2 Kaplan-Meier and log-rank
+
+```{r cox-km, fig.width=10, fig.height=7}
+km_rows <- list()
+for (nm in names(cox_anchors)) {
+  d <- cox_anchors[[nm]]
+  d$time <- d$.time; d$event <- d$.event
+  fit_km <- fit_km_one(d, "state")
+  km_rows[[length(km_rows) + 1L]] <- run_logrank(d, "state",
+    paste0("admission-anchored 90-day, ", nm))
+
+  cat("Survival table, ", nm, ":\n", sep = "")
+  print(round(summary(fit_km)$table, 2)); cat("\n")
+
+  g <- survminer::ggsurvplot(
+    fit_km, data = d, palette = unname(state_colours),
+    conf.int = TRUE, risk.table = TRUE, risk.table.height = 0.26,
+    pval = TRUE, pval.method = TRUE, break.time.by = 15,
+    xlim = c(0, SURVIVAL_FOLLOWUP),
+    xlab = "Days from admission", ylab = "Overall survival probability",
+    legend.title = nm, legend.labs = levels(d$state),
+    ggtheme = theme_bw() + theme(plot.title = element_text(face = "bold")),
+    title = paste0("90-day survival from admission — ", nm),
+    subtitle = "All deaths within 90 days are events, in-hospital deaths included.")
+  print(g)
+  save_km_fig(g, paste0("fig45_01_km_90d_", nm))
+}
+save_tab(dplyr::bind_rows(km_rows), "tab45_01_logrank",
+         caption = "Log-rank tests, 90-day survival from admission.", digits = 5)
+```
+
+## 5.3 Nested Cox models
+
+```{r cox-nested}
+cox_frame <- function(d, state_col = "state", adjust = ADJUST_USE) {
+  keep <- stats::complete.cases(d[, c(".time", ".event", state_col, adjust),
+                                  drop = FALSE])
+  d[keep, , drop = FALSE]
+}
+
+# IMPORTANT — do NOT wrap this in eval(bquote(...)). bquote() splices the data
+# frame into the stored call BY VALUE, so every subsequent print() of the fit
+# echoes all 1039 rows and the knitted document runs to hundreds of pages.
+# survminer needs that idiom for survfit/survdiff (it re-reads fit$call), but
+# coxph does not: passing `d` as a symbol keeps the call one line long. The
+# formula is written back into the call so that print() shows the model rather
+# than the symbol `form`. x = TRUE stores the design matrix, which is what
+# cox.zph() needs, so nothing ever has to re-evaluate the data argument.
+cox_fit <- function(d, terms,
+                    response = "survival::Surv(.time, .event)") {
+  form <- stats::reformulate(terms, response = response)
+  fit  <- survival::coxph(form, data = d, x = TRUE)
+  fit$call$formula <- form
+  fit
+}
+
+# Compact report of a Cox fit: model, fit statistics, coefficients, intervals.
+# summary.coxph() prints the full call, so fits are reported through this.
+print_cox <- function(fit, label = NULL) {
+  if (!is.null(label)) cat("--- ", label, " ---\n", sep = "")
+  cat("model: ",
+      paste(deparse(stats::formula(fit), width.cutoff = 500L), collapse = " "),
+      "\n", sep = "")
+  s <- summary(fit)
+  cat("n = ", fit$n, ", events = ", fit$nevent,
+      ", concordance = ", round(unname(s$concordance[1]), 4),
+      " (se ", round(unname(s$concordance[2]), 4), ")",
+      ", logLik = ", round(as.numeric(stats::logLik(fit)), 3),
+      ", AIC = ", round(stats::AIC(fit), 2), "\n", sep = "")
+  print(signif(s$coefficients, 4))
+  cat("\nexp(coef) with 95% confidence interval:\n")
+  print(round(s$conf.int[, c(1, 3, 4), drop = FALSE], 4))
+  cat("\n")
+  invisible(fit)
+}
+
+# anova.coxph names its p-value column "Pr(>|Chi|)"; anova.glm uses "Pr(>Chi)".
+# Locating it by pattern is version-proof; indexing by name is not.
+anova_p <- function(a) {
+  j <- grep("^P", names(a)); if (!length(j)) return(NA_real_)
+  as.numeric(a[[j[1]]][2])
+}
+anova_df <- function(a) {
+  j <- which(names(a) == "Df"); if (!length(j)) return(NA_real_)
+  as.numeric(a[[j[1]]][2])
+}
+anova_chisq <- function(a) {
+  j <- grep("^Chisq$", names(a))
+  if (length(j)) return(as.numeric(a[[j[1]]][2]))
+  if (!is.null(a$loglik)) return(2 * abs(diff(a$loglik)))
+  NA_real_
+}
+
+cox_rows <- list(); cox_fits <- list()
+for (nm in names(cox_anchors)) {
+  d <- cox_frame(cox_anchors[[nm]])
+  cat("\n=========================================================\n")
+  cat("Cox, anchor: ", nm, " | complete cases: ", nrow(d),
+      " (events ", sum(d$.event), ")\n", sep = "")
+  cat("=========================================================\n")
+
+  f_state <- cox_fit(d, "state")
+  f_M0    <- cox_fit(d, ADJUST_USE)
+  f_M1    <- cox_fit(d, c("state", ADJUST_USE))
+  cox_fits[[nm]] <- list(data = d, state = f_state, M0 = f_M0, M1 = f_M1)
+
+  print_cox(f_M0, "M0: covariates only")
+  print_cox(f_M1, "M1: covariates + phenotype")
+
+  lrt <- stats::anova(f_M0, f_M1)
+  cat("Likelihood-ratio test, M0 vs M1: chisq = ",
+      round(anova_chisq(lrt), 3), ", df = ", anova_df(lrt), ", p = ",
+      format.pval(anova_p(lrt), digits = 4, eps = 1e-12), "\n\n", sep = "")
+
+  for (k in c("state only", "M0", "M1")) {
+    fit <- switch(k, "state only" = f_state, "M0" = f_M0, "M1" = f_M1)
+    s <- summary(fit)
+    cox_rows[[length(cox_rows) + 1L]] <- tibble::tibble(
+      anchor = nm, model = k, n = nrow(d), events = sum(d$.event),
+      df = length(stats::coef(fit)),
+      AIC = round(stats::AIC(fit), 2), BIC = round(stats::BIC(fit), 2),
+      concordance = round(unname(s$concordance[1]), 4),
+      concordance_se = round(unname(s$concordance[2]), 4),
+      loglik = round(as.numeric(stats::logLik(fit)), 3),
+      LRT_vs_M0_chisq = if (k == "M1") round(anova_chisq(lrt), 3) else NA_real_,
+      LRT_vs_M0_df    = if (k == "M1") anova_df(lrt) else NA_real_,
+      LRT_vs_M0_p     = if (k == "M1") anova_p(lrt)  else NA_real_)
+  }
+}
+cox_tbl <- dplyr::bind_rows(cox_rows)
+save_tab(cox_tbl, "tab45_02_nested_cox",
+         caption = "Nested Cox models for 90-day mortality from admission.",
+         digits = 5)
+```
+
+## 5.4 Hazard ratios
+
+```{r cox-hr, fig.width=9, fig.height=6}
+hr_rows <- list()
+for (nm in names(cox_fits)) {
+  for (k in c("crude", "adjusted")) {
+    fit <- if (k == "crude") cox_fits[[nm]]$state else cox_fits[[nm]]$M1
+    td <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) |>
+      dplyr::mutate(term = sub("^state", "", term),
+                    anchor = nm, model = k,
+                    cross_one = conf.low <= 1 & conf.high >= 1,
+                    n = cox_fits[[nm]]$M1$n)
+    hr_rows[[length(hr_rows) + 1L]] <- td
+  }
+}
+hr_table <- dplyr::bind_rows(hr_rows) |>
+  dplyr::select(anchor, model, term, estimate, conf.low, conf.high, p.value,
+                n, cross_one)
+save_tab(hr_table |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                                 ~ round(.x, 4))),
+         "tab45_03_hazard_ratios",
+         caption = paste0("Hazard ratios for 90-day mortality from admission. ",
+                          "Adjusted for ", paste(ADJUST_USE, collapse = ", "),
+                          ". Reference state: ", REF_STATE, "."))
+
+shift_hr <- hr_table |>
+  dplyr::filter(term %in% state_levels) |>
+  dplyr::select(anchor, term, model, estimate) |>
+  tidyr::pivot_wider(names_from = model, values_from = estimate) |>
+  dplyr::mutate(pct_change = round(100 * (adjusted - crude) / crude, 1),
+                direction = ifelse(adjusted > crude, "strengthens", "attenuates"))
+save_tab(shift_hr, "tab45_04_confounding_shift",
+         caption = "Movement of each hazard ratio when the adjustment set is added.")
+
+for (nm in names(cox_fits)) {
+  td <- hr_table |> dplyr::filter(anchor == nm, term %in% state_levels)
+  if (nrow(td) == 0) next
+  g <- plot_forest(td, paste0("90-day mortality — ", nm, " anchor"),
+                   paste0("Reference: ", REF_STATE, ". Adjusted for ",
+                          paste(ADJUST_USE, collapse = ", "), "."),
+                   xlab = "Hazard ratio (log scale)")
+  print(g); save_fig(g, paste0("fig45_02_forest_", nm), width = 9, height = 6)
+}
+
+td_adj_cox <- hr_table |>
+  dplyr::filter(model == "adjusted", !term %in% state_levels) |>
+  dplyr::mutate(model = anchor)
+if (nrow(td_adj_cox) > 0) {
+  g <- plot_forest(td_adj_cox, "Adjustment covariates, 90-day mortality",
+                   "State terms omitted.", xlab = "Hazard ratio (log scale)")
+  print(g); save_fig(g, "fig45_03_forest_adjusters", width = 9, height = 5)
+}
+```
+## 5.5
+
+```{r cox-ph-check, fig.width=11, fig.height=7}
+zph_rows <- list()
+for (nm in names(cox_fits)) {
+  z <- survival::cox.zph(cox_fits[[nm]]$M1)
+  cat("\n── Schoenfeld residual test, ", nm, " anchor ──\n", sep = "")
+  print(z)
+  zt <- as.data.frame(z$table); zt$term <- rownames(zt); zt$anchor <- nm
+  zph_rows[[length(zph_rows) + 1L]] <- tibble::as_tibble(zt)
+
+  save_base_fig({
+    graphics::par(mfrow = c(2, ceiling(nrow(z$table) / 2)))
+    plot(z)
+    graphics::par(mfrow = c(1, 1))
+  }, paste0("fig45_04_schoenfeld_", nm), width = 11, height = 7)
+}
+zph_tbl <- dplyr::bind_rows(zph_rows) |>
+  dplyr::select(anchor, term, chisq, df, p)
+
+# Bonferroni across the terms tested within each anchor. Six simultaneous
+# tests at the 5% level produce a false flag about one time in four, so the
+# raw column alone is not a basis for changing the model.
+n_terms <- zph_tbl |> dplyr::filter(term != "GLOBAL") |>
+  dplyr::count(anchor, name = "n_tests")
+zph_tbl <- zph_tbl |>
+  dplyr::left_join(n_terms, by = "anchor") |>
+  dplyr::mutate(p_bonferroni = ifelse(term == "GLOBAL", NA_real_,
+                                      pmin(1, p * n_tests)))
+
+save_tab(zph_tbl, "tab45_05_proportional_hazards",
+         caption = paste0("Schoenfeld residual test of proportional hazards ",
+                          "for the adjusted Cox models, with Bonferroni ",
+                          "correction across the terms tested within each anchor."),
+         digits = 5)
+
+viol <- zph_tbl |> dplyr::filter(p < 0.05, term != "GLOBAL")
+state_violates <- "state" %in% viol$term
+
+cat("\n----------------------------------------------------------\n")
+if (nrow(viol) == 0) {
+  cat("No evidence against proportional hazards at the 5% level.\n")
+} else {
+  cat("Terms with p < 0.05 (uncorrected):\n"); print(as.data.frame(viol))
+  cat("\nDoes the STATE term violate proportional hazards? ",
+      if (state_violates) "YES" else "NO", "\n", sep = "")
+  if (!state_violates)
+    cat("The phenotype effect is therefore constant over the 90-day window:\n",
+        "a single hazard ratio describes it, and the violations concern the\n",
+        "adjustment covariates only.\n", sep = "")
+}
+cat("----------------------------------------------------------\n")
+```
+
+```{r cox-period-split-helper}
+# Two-period counting-process split, done explicitly. survSplit() is avoided
+# because it cannot parse a formula whose response variables begin with a dot.
+# Subjects are cut at CUT_DAY: those who leave the risk set before it keep a
+# single row; the rest contribute an interval on each side of the cut. The
+# intervals of one subject do not overlap, so the partial likelihood is
+# unchanged and no robust variance is required.
+CUT_DAY <- 14
+
+split_two_periods <- function(d, cut = CUT_DAY,
+                              time_col = ".time", event_col = ".event") {
+  tt <- d[[time_col]]; ev <- d[[event_col]]
+  early <- d
+  early$tstart <- 0
+  early$tstop  <- pmin(tt, cut)
+  early$ev     <- ifelse(tt <= cut, ev, 0L)
+  early$period <- "early"
+
+  late <- d[tt > cut, , drop = FALSE]
+  if (nrow(late) > 0) {
+    late$tstart <- cut
+    late$tstop  <- late[[time_col]]
+    late$ev     <- late[[event_col]]
+    late$period <- "late"
+  }
+
+  out <- dplyr::bind_rows(early, late)
+  out$period <- factor(out$period, levels = c("early", "late"),
+                       labels = c(paste0("day 0-", cut),
+                                  paste0("day ", cut + 1, "-", SURVIVAL_FOLLOWUP)))
+  out <- out[out$tstop > out$tstart, , drop = FALSE]
+  out
+}
+
+# Period-specific coding of one variable. Outside its own period the variable
+# is held at the reference level (factors) or at zero (numeric), so each
+# coefficient is interpretable as that period's effect with the other period
+# contributing nothing.
+make_period_terms <- function(dsplit, var, ref_level = NULL) {
+  x <- dsplit[[var]]
+  per <- levels(dsplit$period)
+  newnames <- character()
+  for (k in seq_along(per)) {
+    nm <- paste0(var, "__", c("early", "late")[k])
+    inper <- dsplit$period == per[k]
+    if (is.factor(x) || is.character(x)) {
+      xf <- as.character(x)
+      base <- if (!is.null(ref_level)) ref_level else levels(factor(xf))[1]
+      v <- ifelse(inper, xf, base)
+      dsplit[[nm]] <- stats::relevel(factor(v, levels = levels(factor(xf))),
+                                     ref = base)
+    } else {
+      dsplit[[nm]] <- ifelse(inper, as.numeric(x), 0)
+    }
+    newnames <- c(newnames, nm)
+  }
+  attr(dsplit, "period_terms") <- newnames
+  dsplit
+}
+```
+
+```{r cox-ph-remedy}
+# Two questions are asked, in this order.
+#   (A) Are the state hazard ratios robust to relaxing proportionality on the
+#       covariates that violate it? This is remediation.
+#   (B) Do the state hazard ratios differ between the early and the late
+#       period? This is exploratory: the Schoenfeld test did not flag state,
+#       so a difference is not expected, but the front-loading reading of
+#       Sections 4.1 to 4.3 makes it a question worth answering directly.
+
+d_prim   <- cox_fits[[PRIMARY_ANCHOR]]$data
+d_split  <- split_two_periods(d_prim)
+cat("Primary anchor: ", nrow(d_prim), " subjects -> ", nrow(d_split),
+    " counting-process rows; events preserved: ",
+    sum(d_split$ev), " vs ", sum(d_prim$.event), "\n\n", sep = "")
+stopifnot(sum(d_split$ev) == sum(d_prim$.event))
+
+viol_vars <- intersect(unique(viol$term[viol$anchor == PRIMARY_ANCHOR]),
+                       c("state", ADJUST_USE))
+viol_covars <- setdiff(viol_vars, "state")
+
+# ---- (A) relax proportionality on the violating covariates -----------------
+if (length(viol_covars) > 0) {
+  dA <- d_split; extra <- character()
+  for (v in viol_covars) {
+    dA <- make_period_terms(dA, v)
+    extra <- c(extra, attr(dA, "period_terms"))
+  }
+  terms_A <- c("state", setdiff(ADJUST_USE, viol_covars), extra)
+  fA <- cox_fit(dA, terms_A, response = "survival::Surv(tstart, tstop, ev)")
+  cat("=== (A) Proportionality relaxed on: ",
+      paste(viol_covars, collapse = ", "), " ===\n", sep = "")
+  print_cox(fA)
+
+  # The point of (A): do the state hazard ratios move?
+  hr_main <- broom::tidy(cox_fits[[PRIMARY_ANCHOR]]$M1, exponentiate = TRUE,
+                         conf.int = TRUE) |>
+    dplyr::filter(grepl("^state", term)) |>
+    dplyr::transmute(term = sub("^state", "", term), HR_main = estimate,
+                     lo_main = conf.low, hi_main = conf.high)
+  hr_A <- broom::tidy(fA, exponentiate = TRUE, conf.int = TRUE) |>
+    dplyr::filter(grepl("^state", term)) |>
+    dplyr::transmute(term = sub("^state", "", term), HR_relaxed = estimate,
+                     lo_relaxed = conf.low, hi_relaxed = conf.high)
+  sens <- dplyr::left_join(hr_main, hr_A, by = "term") |>
+    dplyr::mutate(pct_change = round(100 * (HR_relaxed - HR_main) / HR_main, 1))
+  cat("\nState hazard ratios, main model vs proportionality-relaxed model:\n")
+  print(as.data.frame(sens), digits = 4)
+  save_tab(sens |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                               ~ round(.x, 4))),
+           "tab45_06_ph_sensitivity",
+           caption = paste0("State hazard ratios before and after relaxing ",
+                            "proportional hazards on ",
+                            paste(viol_covars, collapse = ", "),
+                            ". A small change indicates the phenotype effect ",
+                            "is not an artefact of the violation."))
+}
+
+# ---- (B) period-specific state effects (exploratory) -----------------------
+dB <- make_period_terms(d_split, "state", ref_level = REF_STATE)
+state_terms <- attr(dB, "period_terms")
+terms_B <- c(state_terms, ADJUST_USE)
+fB <- cox_fit(dB, terms_B, response = "survival::Surv(tstart, tstop, ev)")
+cat("\n=== (B) Period-specific state effects, cut at day ", CUT_DAY,
+    " (exploratory) ===\n", sep = "")
+print_cox(fB)
+
+# Formal test that the two periods share one state effect: the period-specific
+# model against the main model, which is the constant-effect special case.
+f_const <- cox_fit(dB, c("state", ADJUST_USE),
+                   response = "survival::Surv(tstart, tstop, ev)")
+lrt_B <- stats::anova(f_const, fB)
+cat("\nLikelihood-ratio test, constant vs period-specific state effect:\n")
+cat("  chisq = ", round(anova_chisq(lrt_B), 3), ", df = ", anova_df(lrt_B),
+    ", p = ", format.pval(anova_p(lrt_B), digits = 4, eps = 1e-12),
+    "\n\n", sep = "")
+
+ts <- broom::tidy(fB, exponentiate = TRUE, conf.int = TRUE) |>
+  dplyr::filter(grepl("^state__", term)) |>
+  dplyr::mutate(
+    period = ifelse(grepl("__early", term),
+                    paste0("day 0-", CUT_DAY),
+                    paste0("day ", CUT_DAY + 1, "-", SURVIVAL_FOLLOWUP)),
+    state  = sub("^state__(early|late)", "", term)) |>
+  dplyr::select(period, state, estimate, conf.low, conf.high, p.value)
+save_tab(ts |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                           ~ round(.x, 4))),
+         "tab45_07_period_specific_hr",
+         caption = paste0("Period-specific state hazard ratios, follow-up ",
+                          "split at day ", CUT_DAY,
+                          ". Exploratory: the Schoenfeld test did not flag ",
+                          "the state term."))
+save_tab(tibble::tibble(
+    comparison = "constant state effect vs period-specific state effect",
+    chisq = round(anova_chisq(lrt_B), 3), df = anova_df(lrt_B),
+    p = anova_p(lrt_B)),
+  "tab45_08_period_specific_lrt",
+  caption = "Likelihood-ratio test for a period-specific state effect.",
+  digits = 5)
+```
+
+```{r cox-period-fig, fig.width=9, fig.height=5}
+if (exists("ts") && nrow(ts) > 0) {
+  p_per <- ts |>
+    dplyr::mutate(state = factor(state, levels = state_levels),
+                  cross_one = conf.low <= 1 & conf.high >= 1) |>
+    ggplot(aes(x = estimate, y = state, colour = period)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "red") +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                   height = 0.18, linewidth = 0.6,
+                   position = position_dodge(width = 0.45)) +
+    geom_point(size = 2.6, position = position_dodge(width = 0.45)) +
+    scale_x_log10() +
+    scale_colour_manual(values = c("#c0392b", "#1a6faf"), name = NULL) +
+    labs(title = "Period-specific hazard ratios for 90-day mortality",
+         subtitle = paste0("Follow-up split at day ", CUT_DAY,
+                           ". Reference: ", REF_STATE,
+                           " within each period. Exploratory."),
+         x = "Hazard ratio (log scale)", y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_per)
+  save_fig(p_per, "fig45_05_period_specific_hr", width = 9, height = 5)
+}
+```
+## 5.6 Anchor comparison, and post-discharge as a secondary analysis
+
+```{r cox-anchor-comparison}
+cdx <- build_cox(common_data |> dplyr::rename(state = state_admission),
+                 "state") |>
+  dplyr::rename(state_admission = state)
+cdx$state_day7 <- stats::relevel(droplevels(cdx$state_day7), ref = REF_STATE)
+cdx <- cdx[stats::complete.cases(cdx[, c(".time", ".event", "state_admission",
+                                         "state_day7", ADJUST_USE),
+                                     drop = FALSE]), ]
+cat("Common subcohort for the Cox comparison: n = ", nrow(cdx),
+    ", events = ", sum(cdx$.event), "\n\n", sep = "")
+
+cox_cmp_fits <- list(
+  M0        = cox_fit(cdx, ADJUST_USE),
+  admission = cox_fit(cdx, c("state_admission", ADJUST_USE)),
+  day7      = cox_fit(cdx, c("state_day7", ADJUST_USE)),
+  both      = cox_fit(cdx, c("state_admission", "state_day7", ADJUST_USE)))
+
+cox_cmp_tbl <- purrr::imap_dfr(cox_cmp_fits, function(fit, nm) {
+  s <- summary(fit)
+  tibble::tibble(model = nm, n = nrow(cdx), events = sum(cdx$.event),
+                 df = length(stats::coef(fit)),
+                 AIC = round(stats::AIC(fit), 2),
+                 BIC = round(stats::BIC(fit), 2),
+                 concordance = round(unname(s$concordance[1]), 4),
+                 concordance_se = round(unname(s$concordance[2]), 4))
+})
+save_tab(cox_cmp_tbl, "tab45_09_anchor_comparison",
+         caption = paste0("Cox anchor comparison on the common subcohort (n = ",
+                          nrow(cdx), ")."))
+
+cox_lrt <- dplyr::bind_rows(
+  {a <- stats::anova(cox_cmp_fits$admission, cox_cmp_fits$both)
+   tibble::tibble(comparison = "admission -> + day-7 state",
+                  chisq = round(anova_chisq(a), 3), df = anova_df(a),
+                  p = anova_p(a))},
+  {a <- stats::anova(cox_cmp_fits$day7, cox_cmp_fits$both)
+   tibble::tibble(comparison = "day-7 -> + admission phenotype",
+                  chisq = round(anova_chisq(a), 3), df = anova_df(a),
+                  p = anova_p(a))},
+  {a <- stats::anova(cox_cmp_fits$M0, cox_cmp_fits$admission)
+   tibble::tibble(comparison = "M0 -> + admission phenotype",
+                  chisq = round(anova_chisq(a), 3), df = anova_df(a),
+                  p = anova_p(a))},
+  {a <- stats::anova(cox_cmp_fits$M0, cox_cmp_fits$day7)
+   tibble::tibble(comparison = "M0 -> + day-7 state",
+                  chisq = round(anova_chisq(a), 3), df = anova_df(a),
+                  p = anova_p(a))})
+cat("Incremental contribution of each anchor (Cox):\n")
+print(as.data.frame(cox_lrt))
+save_tab(cox_lrt, "tab45_10_anchor_lrt",
+         caption = "Likelihood-ratio tests for the incremental contribution of each anchor, 90-day mortality.",
+         digits = 5)
+```
+
+```{r cox-postdischarge, fig.width=10, fig.height=7}
+# SECONDARY. Time origin = discharge; in-hospital deaths are undefined and
+# excluded, which is an informative selection. Reported to show the two
+# anchorings agree, not as the primary estimand.
+if (DATE_OF_DEATH_COL %in% names(df_full)) {
+  death_dis <- patient_level(DATE_OF_DEATH_COL) |>
+    dplyr::rename(days_to_death = dplyr::all_of(DATE_OF_DEATH_COL))
+
+  pd <- model_admission |>
+    dplyr::inner_join(death_dis, by = "ID") |>
+    dplyr::filter(days_to_death != -2L) |>
+    dplyr::mutate(
+      .event = as.integer(days_to_death >= 1L &
+                          days_to_death <= SURVIVAL_FOLLOWUP),
+      .time  = ifelse(.event == 1, as.numeric(days_to_death),
+                      as.numeric(SURVIVAL_FOLLOWUP)))
+  pd$state <- stats::relevel(droplevels(pd$state), ref = REF_STATE)
+  pd <- pd[stats::complete.cases(pd[, c(".time", ".event", "state", ADJUST_USE),
+                                    drop = FALSE]), ]
+  cat("Post-discharge (secondary): n = ", nrow(pd), ", events = ",
+      sum(pd$.event), "; in-hospital deaths excluded = ",
+      sum(death_dis$days_to_death == -2L, na.rm = TRUE), "\n\n", sep = "")
+
+  f_pd <- cox_fit(pd, c("state", ADJUST_USE))
+  print_cox(f_pd, "Secondary Cox, time origin = discharge")
+  td_pd <- broom::tidy(f_pd, exponentiate = TRUE, conf.int = TRUE) |>
+    dplyr::mutate(term = sub("^state", "", term),
+                  n = f_pd$n, events = f_pd$nevent,
+                  excluded_inhospital_deaths =
+                    sum(death_dis$days_to_death == -2L, na.rm = TRUE))
+  save_tab(td_pd |> dplyr::mutate(dplyr::across(dplyr::where(is.numeric),
+                                                ~ round(.x, 4))),
+           "tab45_11_postdischarge_secondary",
+           caption = "Secondary Cox model, time origin = discharge, in-hospital deaths excluded.")
+
+  pd$time <- pd$.time; pd$event <- pd$.event
+  g_pd <- survminer::ggsurvplot(
+    fit_km_one(pd, "state"), data = pd, palette = unname(state_colours),
+    conf.int = TRUE, risk.table = TRUE, risk.table.height = 0.26,
+    pval = TRUE, pval.method = TRUE, break.time.by = 30,
+    xlim = c(0, SURVIVAL_FOLLOWUP),
+    xlab = "Days from discharge", ylab = "Post-discharge survival probability",
+    legend.title = "admission phenotype", legend.labs = levels(pd$state),
+    ggtheme = theme_bw() + theme(plot.title = element_text(face = "bold")),
+    title = "Post-discharge survival by admission phenotype (secondary)",
+    subtitle = "In-hospital deaths excluded by construction: an informative selection.")
+  print(g_pd)
+  save_km_fig(g_pd, "fig45_06_km_postdischarge_secondary")
+}
+```
+
+# 6. Trajectory dynamics and the day-`r DAY_TARGET` alert
+
+*Chapter 4, Section 4.6.*
+
+Section 1 established that roughly one patient in seven changes state
+during the admission. Sections 6.1 describes those patients
+retrospectively, with the whole trajectory in hand. Sections 6.2 onward
+ask the prospective question instead: can a change be detected as it
+happens, using only what is known at the time?
+
+That question was not posed for statistical reasons. The ward asked
+for model-based support around the end of the first week, which is when
+their own clinical review of an ongoing admission takes place. The
+alert rule below is the direct translation of that request: at day
+`r DAY_TARGET` and every two days thereafter, compare the patient's
+current online state with the state at a reference day, and raise a
+flag when the two differ.
+
+## 6.1 Switcher trajectories
+
+```{r switcher-alluvial, fig.width=11, fig.height=6}
+switcher_ids <- patient_states$ID[patient_states$pattern == "switcher"]
+cat("Switchers: ", length(switcher_ids), " of ", nrow(patient_states),
+    " (", round(100 * length(switcher_ids) / nrow(patient_states), 1), "%)\n",
+    sep = "")
+
+allu_sw <- build_alluvial_df(switcher_ids, SWITCHER_CHECKPOINTS) |>
+  dplyr::filter(Freq >= MIN_TRAJECTORY_FREQ)
+
+p_allu_sw <- plot_alluvial(
+  allu_sw, SWITCHER_CHECKPOINTS,
+  "Switcher trajectories",
+  paste0(length(switcher_ids),
+         " patients occupying more than one state during the admission. ",
+         "Checkpoints: ", paste0("day ", SWITCHER_CHECKPOINTS, collapse = ", "),
+         "."))
+p_allu_sw
+save_fig(p_allu_sw, "fig46_01_switcher_alluvial", width = 11, height = 6)
+```
+
+```{r switcher-transitions, fig.width=6.5, fig.height=5.5}
+# Which moves switchers actually make: pooled first-to-last state change over
+# consecutive grid days, diagonal blanked.
+moves <- hmm_data |>
+  dplyr::filter(ID %in% switcher_ids) |>
+  dplyr::arrange(ID, time) |>
+  dplyr::group_by(ID) |>
+  dplyr::mutate(prev = dplyr::lag(as.character(state))) |>
+  dplyr::ungroup() |>
+  dplyr::filter(!is.na(prev), prev != as.character(state)) |>
+  dplyr::count(prev, state, name = "n")
+
+moves_grid <- moves |>
+  dplyr::mutate(prev = factor(prev, levels = state_levels),
+                state = factor(as.character(state), levels = rev(state_levels)))
+
+p_moves <- ggplot(moves_grid, aes(prev, state, fill = n)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = n), size = 3.2) +
+  scale_fill_gradient(low = "#fde0d9", high = "#c0392b", name = "Moves") +
+  labs(title = "State changes made by switchers",
+       subtitle = "Pooled over consecutive days; patients who stay are not counted.",
+       x = "From", y = "To") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 20, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_moves
+save_fig(p_moves, "fig46_02_switcher_transitions", width = 6.5, height = 5.5)
+save_tab(moves |> dplyr::rename(from = prev, to = state),
+         "tab46_01_switcher_moves",
+         caption = "Day-to-day state changes among switchers.")
+```
+
+```{r trajectory-heatmaps, fig.width=10, fig.height=12}
+# One row per patient, x = day, fill = decoded state, faceted by outcome.
+# Tiles turn light grey from the day of death onwards.
+plot_trajectories <- function(outcome_col, is_dead_col = IS_DEAD_COL) {
+  if (!outcome_col %in% names(df_full)) return(NULL)
+  if (!is_dead_col %in% names(df_full)) return(NULL)
+
+  pid_outcome <- df_full |>
+    dplyr::group_by(ID) |>
+    dplyr::summarise(outcome = dplyr::first(stats::na.omit(.data[[outcome_col]])),
+                     .groups = "drop") |>
+    dplyr::filter(!is.na(outcome))
+
+  is_dead_long <- df_full |>
+    dplyr::select(ID, time, dplyr::all_of(is_dead_col)) |>
+    dplyr::rename(is_dead = !!is_dead_col)
+
+  dstate <- hmm_data |>
+    dplyr::left_join(is_dead_long, by = c("ID", "time")) |>
+    dplyr::mutate(state_or_dead = dplyr::if_else(
+      !is.na(is_dead) & is_dead == 1, NA_character_, as.character(state)))
+
+  pid_order <- dstate |>
+    dplyr::inner_join(pid_outcome, by = "ID") |>
+    dplyr::arrange(ID, time) |>
+    dplyr::group_by(ID) |>
+    dplyr::summarise(
+      outcome     = dplyr::first(outcome),
+      first_state = match(state_or_dead[which.min(time)], state_levels),
+      worst_state = suppressWarnings(max(match(state_or_dead, state_levels),
+                                         na.rm = TRUE)),
+      .groups = "drop") |>
+    dplyr::mutate(worst_state = ifelse(is.infinite(worst_state), NA_integer_,
+                                       worst_state)) |>
+    dplyr::arrange(outcome, first_state, worst_state) |>
+    dplyr::group_by(outcome) |>
+    dplyr::mutate(rank_in_facet = dplyr::row_number()) |>
+    dplyr::ungroup()
+
+  plot_df <- dstate |>
+    dplyr::inner_join(pid_order, by = "ID") |>
+    dplyr::mutate(state_factor = factor(state_or_dead, levels = state_levels),
+                  outcome_lbl  = paste0(outcome_col, " = ", outcome))
+
+  ggplot(plot_df, aes(x = time, y = rank_in_facet, fill = state_factor)) +
+    geom_tile(width = 1, height = 1) +
+    facet_grid(outcome_lbl ~ ., scales = "free_y", space = "free_y",
+               switch = "y") +
+    scale_fill_manual(values = state_colours, na.value = "grey85",
+                      name = "State", na.translate = TRUE) +
+    scale_x_continuous(breaks = seq(0, 14, 2), expand = c(0, 0)) +
+    scale_y_reverse(expand = c(0, 0)) +
+    labs(title = paste0("Decoded trajectories by ", outcome_col),
+         subtitle = "Light grey: patient deceased on or after that day. Sorted by first, then worst state.",
+         x = "Day", y = "Patient (ranked)") +
+    theme_minimal(base_size = 11) +
+    theme(strip.placement = "outside",
+          strip.text.y.left = element_text(face = "bold", angle = 0, hjust = 1),
+          strip.background = element_rect(fill = "grey95", colour = NA),
+          axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          panel.grid = element_blank(), legend.position = "bottom",
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+}
+
+for (oc in TRAJECTORY_OUTCOMES) {
+  g <- plot_trajectories(oc)
+  if (is.null(g)) { cat("Trajectory heatmap skipped for ", oc, ".\n", sep = ""); next }
+  print(g)
+  save_fig(g, paste0("fig46_03_trajectories_", oc), width = 10, height = 12)
+}
+```
+
+## 6.2 The alert rule
+
+At each check day the patient's online state is compared with the state
+at a reference day. The first check is at day `r DAY_TARGET` and is
+compared against admission, so it summarises the whole first week; the
+later checks are compared against the state two days earlier, so they
+detect fresh movement rather than re-reporting an old change. Every
+state used here is an online state: at check day $d$ the model has seen
+days $0,\dots,d$ and nothing else.
+
+```{r alert-config}
+ALERT_PAIRS <- tibble::tibble(check_day = ALERT_CHECK_DAYS,
+                              prev_day  = ALERT_PREV_DAYS)
+alert_days_all <- sort(unique(c(ALERT_PAIRS$check_day, ALERT_PAIRS$prev_day)))
+
+cat("Online states required at days: ",
+    paste(alert_days_all, collapse = ", "), "\n", sep = "")
+print(ALERT_PAIRS)
+```
+
+```{r alert-online-states}
+online_states <- purrr::map_dfr(alert_days_all, build_online_state)
+
+cat("\nOnline-state rows built: ", nrow(online_states), "\n", sep = "")
+cat("Patients per checkpoint:\n")
+print(online_states |> dplyr::count(day))
+```
+
+```{r alert-detection}
+alerts <- purrr::pmap_dfr(ALERT_PAIRS, function(check_day, prev_day) {
+  now  <- online_states |> dplyr::filter(day == check_day) |>
+            dplyr::transmute(ID, state_now = state)
+  prev <- online_states |> dplyr::filter(day == prev_day) |>
+            dplyr::transmute(ID, state_prev = state)
+  dplyr::inner_join(now, prev, by = "ID") |>
+    dplyr::mutate(check_day = check_day, prev_day = prev_day,
+                  alert = state_now != state_prev)
+})
+
+patient_alert <- alerts |>
+  dplyr::group_by(ID) |>
+  dplyr::summarise(n_alerts    = sum(alert),
+                   ever_alert  = any(alert),
+                   first_alert_day = if (any(alert)) min(check_day[alert])
+                                     else NA_integer_,
+                   .groups = "drop")
+
+cat("Patients evaluated: ", dplyr::n_distinct(alerts$ID), "\n", sep = "")
+cat("Patients with at least one alert: ", sum(patient_alert$ever_alert),
+    " (", round(100 * mean(patient_alert$ever_alert), 1), "%)\n\n", sep = "")
+
+window_tbl <- alerts |>
+  dplyr::group_by(check_day, prev_day) |>
+  dplyr::summarise(n_evaluated = dplyr::n(), n_alerts = sum(alert),
+                   pct = round(100 * mean(alert), 2), .groups = "drop")
+save_tab(window_tbl, "tab46_02_alerts_per_window",
+         caption = "Alerts raised at each checkpoint, with the reference day used for the comparison.")
+```
+
+## 6.3 Alert incidence and direction of change
+
+```{r alert-rate-fig, fig.width=8, fig.height=4}
+p_rate <- window_tbl |>
+  dplyr::mutate(window = sprintf("day %d \u2192 day %d", prev_day, check_day),
+                window = factor(window, levels = window)) |>
+  ggplot(aes(x = window, y = pct)) +
+  geom_col(fill = "#c0392b", width = 0.6, alpha = 0.9) +
+  geom_text(aes(label = paste0(n_alerts, "/", n_evaluated)),
+            vjust = -0.4, size = 3.2) +
+  labs(title = "Alert rate by checkpoint window",
+       subtitle = "Label = alerts / patients evaluated in that window.",
+       x = NULL, y = "Alerts (% of patients evaluated)") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_rate
+save_fig(p_rate, "fig46_04_alert_rate_by_window", width = 8, height = 4)
+```
+
+```{r alert-heatmaps, fig.width=5.5, fig.height=4.8}
+changes_grid <- function(sub, panel) {
+  tab <- sub |>
+    dplyr::count(state_prev, state_now, name = "n") |>
+    tidyr::complete(state_prev = state_levels, state_now = state_levels,
+                    fill = list(n = 0))
+  tab$n[as.character(tab$state_prev) == as.character(tab$state_now)] <- NA
+  tab$panel      <- panel
+  tab$state_prev <- factor(tab$state_prev, levels = state_levels)
+  tab$state_now  <- factor(tab$state_now,  levels = rev(state_levels))
+  tab
+}
+
+heat_layer <- function(df) {
+  ggplot(df, aes(state_prev, state_now, fill = n)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = ifelse(is.na(n) | n == 0, "", n)), size = 3) +
+    scale_fill_gradient(low = "#fde0d9", high = "#c0392b", na.value = "grey96",
+                        name = "Patients") +
+    labs(x = "State (from)", y = "State (to)") +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1),
+          panel.grid = element_blank(),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 8))
+}
+
+p_heat_tot <- heat_layer(changes_grid(alerts, "Total")) +
+  labs(title = "Alerts by direction of change",
+       subtitle = "All checkpoint windows pooled; the diagonal is blanked.")
+p_heat_tot
+save_fig(p_heat_tot, "fig46_05_alert_changes_total", width = 5.5, height = 4.8)
+```
+
+```{r alert-heatmaps-windows, fig.width=8, fig.height=7.2}
+win_labels <- sprintf("day %d \u2192 day %d", ALERT_PAIRS$prev_day,
+                      ALERT_PAIRS$check_day)
+trans_windows <- purrr::map_dfr(seq_len(nrow(ALERT_PAIRS)), function(k)
+  changes_grid(dplyr::filter(alerts,
+                             check_day == ALERT_PAIRS$check_day[k],
+                             prev_day  == ALERT_PAIRS$prev_day[k]),
+               win_labels[k]))
+trans_windows$panel <- factor(trans_windows$panel, levels = win_labels)
+
+p_heat_win <- heat_layer(trans_windows) + facet_wrap(~ panel, ncol = 2) +
+  labs(title = "Alerts by direction of change, per window")
+p_heat_win
+save_fig(p_heat_win, "fig46_06_alert_changes_by_window", width = 8, height = 7.2)
+```
+
+```{r alert-flow, fig.width=9, fig.height=5}
+day_cols <- paste0("d", alert_days_all)
+state_wide <- online_states |>
+  dplyr::mutate(dtag = paste0("d", day)) |>
+  dplyr::select(ID, dtag, state) |>
+  tidyr::pivot_wider(names_from = dtag, values_from = state) |>
+  dplyr::filter(dplyr::if_all(dplyr::all_of(day_cols), ~ !is.na(.)))
+
+if (nrow(state_wide) > 0) {
+  lodes <- ggalluvial::to_lodes_form(as.data.frame(state_wide),
+                                     axes = day_cols, id = "ID")
+  lodes$x <- factor(lodes$x, levels = day_cols,
+                    labels = paste0("day ", alert_days_all))
+  p_flow <- ggplot(lodes, aes(x = x, stratum = stratum, alluvium = ID,
+                              fill = stratum, label = stratum)) +
+    ggalluvial::geom_flow(stat = "alluvium", alpha = 0.55) +
+    ggalluvial::geom_stratum(alpha = 0.9) +
+    scale_fill_manual(values = state_colours, name = NULL) +
+    labs(title = "Online-state flow across the alert checkpoints",
+         subtitle = paste0("Patients with a complete set of online states (n = ",
+                           nrow(state_wide), ")."),
+         x = NULL, y = "Patients") +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_flow)
+  save_fig(p_flow, "fig46_07_alert_state_flow", width = 9, height = 5)
+}
+```
+
+```{r alert-timing-fig, fig.width=7, fig.height=4}
+p_first <- patient_alert |>
+  dplyr::filter(!is.na(first_alert_day)) |>
+  dplyr::count(first_alert_day, name = "patients") |>
+  ggplot(aes(x = factor(first_alert_day), y = patients)) +
+  geom_col(fill = "#c0392b", width = 0.6, alpha = 0.9) +
+  geom_text(aes(label = patients), vjust = -0.4, size = 3.2) +
+  labs(title = "Day of the first alert",
+       subtitle = "Among patients who ever alert.",
+       x = "Check day", y = "Patients") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_first
+save_fig(p_first, "fig46_08_first_alert_day", width = 7, height = 4)
+```
+
+## 6.4 The alerted population against the Chapter 3 switchers
+
+The two populations are not the same object and must not be conflated.
+A **switcher** is defined retrospectively, from the globally decoded
+sequence over the whole admission. An **alerted patient** is defined
+prospectively, from online states at four fixed checkpoints, and only
+for patients still alive and panelled at those days. The cross-tabulation
+below quantifies how much of the retrospective picture the prospective
+rule recovers.
+
+```{r alert-vs-switcher}
+cmp_pop <- patient_alert |>
+  dplyr::inner_join(patient_states |> dplyr::select(ID, pattern), by = "ID")
+
+tab_pop <- table(occupancy = cmp_pop$pattern,
+                 alerted   = cmp_pop$ever_alert)
+cat("Chapter-3 occupancy pattern x alert status (n = ", nrow(cmp_pop), "):\n",
+    sep = "")
+print(tab_pop)
+cat("\nRow proportions:\n"); print(round(prop.table(tab_pop, margin = 1), 3))
+
+sens <- tab_pop["switcher", "TRUE"] / sum(tab_pop["switcher", ])
+spec <- tab_pop["stayer",  "FALSE"] / sum(tab_pop["stayer", ])
+cat("\nShare of switchers that raise at least one alert: ",
+    round(100 * sens, 1), "%\n", sep = "")
+cat("Share of stayers that never alert: ", round(100 * spec, 1), "%\n", sep = "")
+
+pop_df <- as.data.frame(tab_pop); names(pop_df) <- c("occupancy", "alerted", "n")
+save_tab(pop_df, "tab46_03_alert_vs_switcher",
+         caption = "Retrospective occupancy pattern against prospective alert status.")
+```
+
+```{r alert-vs-switcher-fig, fig.width=6.5, fig.height=4}
+p_pop <- cmp_pop |>
+  ggplot(aes(x = pattern, fill = ever_alert)) +
+  geom_bar(position = "fill", width = 0.6) +
+  scale_fill_manual(values = c(`FALSE` = "grey75", `TRUE` = "#c0392b"),
+                    name = "Ever alerted") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Alert status within each occupancy pattern",
+       subtitle = "Retrospective definition on the x-axis, prospective rule in the fill.",
+       x = NULL, y = "Share of patients") +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(size = 9))
+p_pop
+save_fig(p_pop, "fig46_09_alert_vs_switcher", width = 6.5, height = 4)
+```
+
+## 6.5 Who raises an alert?
+
+Patients who alert are compared with those who do not on the admission
+covariates. Continuous covariates use the Wilcoxon rank-sum test,
+categorical ones Fisher's exact test when any expected count falls
+below five and the chi-square test otherwise. Because the comparison
+spans a long covariate list, p-values are reported both raw and
+adjusted by the Benjamini-Hochberg procedure; the adjusted column is
+the one to read.
+
+```{r alert-covariates}
+covars_pt <- df_full |>
+  dplyr::group_by(ID) |>
+  dplyr::summarise(dplyr::across(
+    dplyr::any_of(c(STRAT_CONTINUOUS, STRAT_CATEGORICAL, "admission_reason")),
+    ~ dplyr::first(stats::na.omit(.x))), .groups = "drop")
+
+strat <- dplyr::inner_join(patient_alert, covars_pt, by = "ID")
+
+# Admission-reason features. Codes are pipe-separated, e.g. "1 | 4 | 10", and
+# the match is on the exact TOKEN, so "10" and "11" are not read as infection.
+if ("admission_reason" %in% names(strat)) {
+  .ar <- as.character(strat$admission_reason)
+  strat$admission_infection <- vapply(.ar, function(s)
+    if (is.na(s)) NA_integer_
+    else as.integer(INFECTION_CODE %in% parse_reasons(s)),
+    integer(1), USE.NAMES = FALSE)
+  strat$count_admission_reasons <- vapply(.ar, function(s)
+    if (is.na(s)) NA_integer_ else length(parse_reasons(s)),
+    integer(1), USE.NAMES = FALSE)
+  cat("Admission reason parsed. Patients admitted with an infection code (",
+      INFECTION_CODE, "): ", sum(strat$admission_infection == 1, na.rm = TRUE),
+      " of ", sum(!is.na(strat$admission_infection)), "\n", sep = "")
+}
+
+# Carry the two anchors into the stratification table as well.
+strat <- strat |>
+  dplyr::left_join(all_day0 |> dplyr::select(ID, depth_state), by = "ID") |>
+  dplyr::left_join(online_day7, by = "ID")
+
+cat("Stratification cohort: ", nrow(strat), " patients (",
+    sum(strat$ever_alert), " with at least one alert).\n\n", sep = "")
+```
+
+```{r alert-stratification-tests}
+cont_present <- intersect(STRAT_CONTINUOUS, names(strat))
+cont_tbl <- purrr::map_dfr(cont_present, function(v) {
+  x <- strat[[v]]; g <- strat$ever_alert
+  if (!is.numeric(x) || dplyr::n_distinct(g) < 2)
+    return(tibble::tibble(covariate = v, type = "continuous",
+                          summary_alert = NA_character_,
+                          summary_noalert = NA_character_, p = NA_real_))
+  fmt <- function(z) sprintf("%.1f [%.1f, %.1f]",
+                             stats::median(z, na.rm = TRUE),
+                             stats::quantile(z, 0.25, na.rm = TRUE),
+                             stats::quantile(z, 0.75, na.rm = TRUE))
+  tibble::tibble(
+    covariate = v, type = "continuous",
+    summary_alert   = fmt(x[g]),
+    summary_noalert = fmt(x[!g]),
+    p = tryCatch(suppressWarnings(stats::wilcox.test(x ~ g)$p.value),
+                 error = function(e) NA_real_))
+})
+
+cat_present <- setdiff(intersect(STRAT_CATEGORICAL, names(strat)),
+                       "admission_reason")
+cat_tbl <- purrr::map_dfr(cat_present, function(v) {
+  tab <- table(strat[[v]], strat$ever_alert)
+  if (nrow(tab) < 2 || ncol(tab) < 2)
+    return(tibble::tibble(covariate = v, type = "categorical",
+                          summary_alert = NA_character_,
+                          summary_noalert = NA_character_, p = NA_real_))
+  use_fisher <- any(suppressWarnings(stats::chisq.test(tab)$expected) < 5)
+  p <- tryCatch(
+    if (use_fisher) stats::fisher.test(tab, simulate.p.value = TRUE, B = 5000)$p.value
+    else suppressWarnings(stats::chisq.test(tab)$p.value),
+    error = function(e) NA_real_)
+  tibble::tibble(covariate = v,
+                 type = paste0("categorical (",
+                               if (use_fisher) "Fisher" else "chi-square", ")"),
+                 summary_alert = NA_character_, summary_noalert = NA_character_,
+                 p = p)
+})
+
+strat_tbl <- dplyr::bind_rows(cont_tbl, cat_tbl) |>
+  dplyr::mutate(p_adj = stats::p.adjust(p, method = P_ADJUST_METHOD)) |>
+  dplyr::arrange(p_adj)
+
+save_tab(strat_tbl |>
+           dplyr::mutate(p = signif(p, 4), p_adj = signif(p_adj, 4)),
+         "tab46_04_alert_stratification",
+         caption = paste0("Admission covariates by alert status. p_adj is the ",
+                          P_ADJUST_METHOD,
+                          "-adjusted p-value across the ", nrow(cont_tbl) + nrow(cat_tbl),
+                          " tests in this table and is the one to read."))
+
+# Level-by-level proportions for the categorical covariates.
+prop_tbl <- purrr::map_dfr(cat_present, function(v) {
+  x <- as.character(strat[[v]]); g <- strat$ever_alert
+  keep <- !is.na(x); x <- x[keep]; g <- g[keep]
+  purrr::map_dfr(sort(unique(x)), function(l) tibble::tibble(
+    variable = v, level = l, n = sum(x == l),
+    pct_total    = round(100 * mean(x == l), 1),
+    pct_no_alert = round(100 * mean(x[!g] == l), 1),
+    pct_alert    = round(100 * mean(x[g]  == l), 1)))
+})
+save_tab(prop_tbl, "tab46_05_alert_categorical_levels",
+         caption = "Composition of the categorical covariates by alert status.")
+```
+
+```{r alert-strat-boxplots, fig.width=9, fig.height=5}
+box_vars <- intersect(STRAT_FOCUS, names(strat))
+box_vars <- box_vars[vapply(strat[box_vars], is.numeric, logical(1))]
+if (length(box_vars) > 0) {
+  p_box <- strat |>
+    tidyr::pivot_longer(dplyr::all_of(box_vars), names_to = "score",
+                        values_to = "value") |>
+    dplyr::filter(!is.na(value)) |>
+    ggplot(aes(ever_alert, value, fill = ever_alert)) +
+    geom_boxplot(outlier.alpha = 0.3, width = 0.6) +
+    facet_wrap(~ score, scales = "free_y") +
+    scale_fill_manual(values = c(`FALSE` = "grey70", `TRUE` = "#c0392b"),
+                      guide = "none") +
+    labs(title = "Admission scores by alert status",
+         subtitle = "See the adjusted p-values in the stratification table.",
+         x = "Ever alerted", y = NULL) +
+    theme(plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_box)
+  save_fig(p_box, "fig46_10_strat_boxplots", width = 9, height = 5)
+}
+```
+
+```{r alert-strat-categorical, fig.width=6, fig.height=6}
+cat_plots <- list()
+for (fc in intersect(STRAT_FOCUS_CAT, names(strat))) {
+  d <- strat |> dplyr::filter(!is.na(.data[[fc]]))
+  if (nrow(d) == 0 || dplyr::n_distinct(d[[fc]]) > 12) next
+  cat_plots[[fc]] <- d |>
+    ggplot(aes(x = ever_alert, fill = factor(.data[[fc]]))) +
+    geom_bar(position = "fill", width = 0.6) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = paste0(fc, " by alert status"), x = "Ever alerted",
+         y = "Share", fill = fc) +
+    theme_minimal(base_size = 9)
+}
+if (length(cat_plots) > 0) {
+  p_cat <- patchwork::wrap_plots(cat_plots, ncol = 1)
+  print(p_cat)
+  save_fig(p_cat, "fig46_11_strat_categorical", width = 6, height = 6)
+}
+```
+
+```{r alert-by-admission-state, fig.width=8, fig.height=4}
+# Alert rate by the state the patient was assigned on admission: the entry
+# point into the stratification of Section 6.7.
+if ("depth_state" %in% names(strat)) {
+  ar_state <- strat |>
+    dplyr::filter(!is.na(depth_state)) |>
+    dplyr::group_by(depth_state) |>
+    dplyr::summarise(n = dplyr::n(), alerts = sum(ever_alert),
+                     rate = round(mean(ever_alert), 3), .groups = "drop")
+  save_tab(ar_state, "tab46_06_alert_rate_by_phenotype",
+           caption = "Alert rate by admission phenotype.")
+
+  p_ar <- ggplot(ar_state, aes(depth_state, rate, fill = depth_state)) +
+    geom_col(width = 0.65) +
+    geom_text(aes(label = paste0(alerts, "/", n)), vjust = -0.4, size = 3.2) +
+    scale_fill_manual(values = state_colours, guide = "none") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Alert rate by admission phenotype",
+         subtitle = "Label = alerted / evaluated patients in that phenotype.",
+         x = NULL, y = "Share raising at least one alert") +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_ar)
+  save_fig(p_ar, "fig46_12_alert_rate_by_phenotype", width = 8, height = 4)
+}
+```
+
+## 6.6 Prognostic content of the alert
+
+Three questions, in order: does alerting carry information about the
+outcome; how would the rule behave as a ward instrument; and is the
+association anything more than the base rate.
+
+```{r alert-logistic}
+alert_predictors <- c("ever_alert", intersect(ADJUST_COVARS, names(strat)))
+
+alert_or_rows <- list()
+for (oc in intersect(OUTCOME_COLS, names(strat))) {
+  for (spec in list(list(lbl = "crude",    pr = "ever_alert"),
+                    list(lbl = "adjusted", pr = alert_predictors))) {
+    d <- strat |> dplyr::select(dplyr::all_of(c(oc, spec$pr))) |> tidyr::drop_na()
+    d[[oc]] <- as_binary(d[[oc]])
+    if (dplyr::n_distinct(d[[oc]]) < 2) next
+    fit <- stats::glm(stats::reformulate(spec$pr, response = oc),
+                      data = d, family = stats::binomial())
+    r2 <- 1 - fit$deviance / fit$null.deviance
+    cat("── ", oc, " ~ ", paste(spec$pr, collapse = " + "),
+        "  (n = ", nrow(d), ", McFadden pseudo-R2 = ", round(r2, 4), ")\n",
+        sep = "")
+    tt <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) |>
+      dplyr::filter(term != "(Intercept)") |>
+      dplyr::mutate(outcome = oc, model = spec$lbl, n = nrow(d),
+                    cross_one = conf.low <= 1 & conf.high >= 1)
+    print(as.data.frame(tt |> dplyr::select(term, estimate, conf.low,
+                                            conf.high, p.value)), digits = 4)
+    cat("\n")
+    alert_or_rows[[length(alert_or_rows) + 1L]] <- tt
+  }
+}
+alert_or <- dplyr::bind_rows(alert_or_rows)
+save_tab(alert_or |> dplyr::select(outcome, model, term, estimate, conf.low,
+                                   conf.high, p.value, n) |>
+           dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 4))),
+         "tab46_07_alert_odds_ratios",
+         caption = paste0("Odds ratios for the alert, crude and adjusted for ",
+                          paste(ADJUST_COVARS, collapse = ", "), "."))
+```
+
+```{r alert-forest, fig.width=8, fig.height=5}
+if (nrow(alert_or) > 0) {
+  g_alert <- alert_or |>
+    dplyr::filter(grepl("ever_alert", term)) |>
+    dplyr::mutate(term = paste0(outcome, " (", model, ")"),
+                  model = outcome) |>
+    plot_forest("Odds ratio of raising an alert",
+                paste0("Adjusted models control for ",
+                       paste(ADJUST_COVARS, collapse = ", "), "."))
+  print(g_alert)
+  save_fig(g_alert, "fig46_13_alert_forest", width = 8, height = 5)
+}
+```
+
+```{r alert-operating-characteristics}
+# The rule read as a ward instrument. "Reviews per event" is the number of
+# alerted patients a clinician would look at for each alerted patient who
+# subsequently experiences the outcome.
+op_tbl <- purrr::map_dfr(intersect(OUTCOME_COLS, names(strat)), function(oc) {
+  d <- strat |> dplyr::select(ever_alert, dplyr::all_of(oc)) |> tidyr::drop_na()
+  y <- as_binary(d[[oc]]); a <- d$ever_alert
+  tp <- sum(a & y == 1); fp <- sum(a & y == 0)
+  fn <- sum(!a & y == 1); tn <- sum(!a & y == 0)
+  tibble::tibble(
+    outcome = oc, n = nrow(d), events = sum(y == 1),
+    alerted = sum(a),
+    sensitivity = round(tp / (tp + fn), 3),
+    specificity = round(tn / (tn + fp), 3),
+    PPV = round(tp / (tp + fp), 3),
+    NPV = round(tn / (tn + fn), 3),
+    reviews_per_event = ifelse(tp == 0, NA_real_, round((tp + fp) / tp, 2)))
+})
+save_tab(op_tbl, "tab46_08_operating_characteristics",
+         caption = "The alert rule read as a screening instrument for each outcome.")
+```
+
+```{r alert-lead-time, fig.width=8, fig.height=4}
+# How much warning the alert gives: days between the first alert and death or
+# discharge.
+lead_cols <- intersect(c(ADMISSION_DEATH_COL, "length_of_stay_days"),
+                       names(df_full))
+if (length(lead_cols) > 0) {
+  lead <- patient_alert |>
+    dplyr::filter(!is.na(first_alert_day)) |>
+    dplyr::left_join(patient_level(lead_cols), by = "ID")
+  if (ADMISSION_DEATH_COL %in% names(lead))
+    lead$days_to_death_after_alert <- ifelse(
+      !is.na(lead[[ADMISSION_DEATH_COL]]) & lead[[ADMISSION_DEATH_COL]] >= 0,
+      lead[[ADMISSION_DEATH_COL]] - lead$first_alert_day, NA_real_)
+  if ("length_of_stay_days" %in% names(lead))
+    lead$days_to_discharge_after_alert <-
+      lead$length_of_stay_days - lead$first_alert_day
+
+  lead_long <- lead |>
+    dplyr::select(ID, dplyr::any_of(c("days_to_death_after_alert",
+                                      "days_to_discharge_after_alert"))) |>
+    tidyr::pivot_longer(-ID, names_to = "horizon", values_to = "days") |>
+    dplyr::filter(!is.na(days))
+
+  if (nrow(lead_long) > 0) {
+    lead_summary <- lead_long |>
+      dplyr::group_by(horizon) |>
+      dplyr::summarise(n = dplyr::n(),
+                       median = stats::median(days),
+                       q25 = stats::quantile(days, 0.25),
+                       q75 = stats::quantile(days, 0.75), .groups = "drop")
+    save_tab(lead_summary, "tab46_09_lead_time",
+             caption = "Days between the first alert and death or discharge.")
+
+    p_lead <- ggplot(lead_long, aes(x = days, fill = horizon)) +
+      geom_histogram(binwidth = 2, colour = "white", alpha = 0.9) +
+      facet_wrap(~ horizon, scales = "free") +
+      scale_fill_manual(values = c(days_to_death_after_alert = "#c0392b",
+                                   days_to_discharge_after_alert = "#1a6faf"),
+                        guide = "none") +
+      labs(title = "Warning given by the alert",
+           subtitle = "Days from the first alert to the event.",
+           x = "Days", y = "Patients") +
+      theme(plot.title = element_text(face = "bold"),
+            plot.subtitle = element_text(size = 9))
+    print(p_lead)
+    save_fig(p_lead, "fig46_14_lead_time", width = 8, height = 4)
+  }
+}
+```
+
+```{r alert-permutation, fig.width=8, fig.height=4}
+# Negative control. The alert labels are permuted PERM_B times, holding the
+# marginal alert rate fixed, and the observed association is compared against
+# the resulting null distribution. This separates signal from base rate.
+set.seed(PERM_SEED)
+
+perm_rows <- list(); perm_draws <- list()
+for (oc in intersect(OUTCOME_COLS, names(strat))) {
+  d <- strat |> dplyr::select(ever_alert, dplyr::all_of(oc)) |> tidyr::drop_na()
+  y <- as_binary(d[[oc]]); a <- as.integer(d$ever_alert)
+  if (dplyr::n_distinct(y) < 2) next
+  stat_fn <- function(av) mean(y[av == 1]) - mean(y[av == 0])
+  obs <- stat_fn(a)
+  null_draws <- replicate(PERM_B, stat_fn(sample(a)))
+  p_perm <- (1 + sum(abs(null_draws) >= abs(obs))) / (PERM_B + 1)
+  perm_rows[[length(perm_rows) + 1L]] <- tibble::tibble(
+    outcome = oc, observed_risk_difference = round(obs, 4),
+    null_mean = round(mean(null_draws), 4),
+    null_sd = round(stats::sd(null_draws), 4),
+    p_permutation = signif(p_perm, 4), B = PERM_B)
+  perm_draws[[oc]] <- tibble::tibble(outcome = oc, stat = null_draws,
+                                     observed = obs)
+}
+perm_tbl <- dplyr::bind_rows(perm_rows)
+if (nrow(perm_tbl) > 0)
+  save_tab(perm_tbl, "tab46_10_permutation",
+           caption = paste0("Permutation negative control: the alert labels are ",
+                            "reshuffled ", PERM_B, " times at a fixed marginal rate."))
+
+if (length(perm_draws) > 0) {
+  pd <- dplyr::bind_rows(perm_draws)
+  p_perm_fig <- ggplot(pd, aes(x = stat)) +
+    geom_histogram(bins = 40, fill = "grey75", colour = "white") +
+    geom_vline(aes(xintercept = observed), colour = "#c0392b", linewidth = 0.9) +
+    facet_wrap(~ outcome, scales = "free") +
+    labs(title = "Permutation null for the alert",
+         subtitle = "Red line: observed difference in risk between alerted and non-alerted patients.",
+         x = "Risk difference under permuted labels", y = "Draws") +
+    theme(plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_perm_fig)
+  save_fig(p_perm_fig, "fig46_15_permutation_null", width = 8, height = 4)
+}
+```
+
+## 6.6bis 
+
+```{r alert-destination}
+# Whether a patient moves and where they move to are different questions. The
+# alert flags the first; this examines the second. For each alerted patient the
+# destination is the online state recorded at their FIRST alert, so the
+# quantity is available at the moment the alert fires.
+dest <- alerts |>
+  dplyr::filter(alert) |>
+  dplyr::group_by(ID) |>
+  dplyr::slice_min(check_day, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::transmute(ID, first_alert_day = check_day,
+                   origin = state_prev, destination = state_now)
+
+alert_dest <- patient_alert |>
+  dplyr::select(ID, ever_alert) |>
+  dplyr::left_join(dest |> dplyr::select(ID, origin, destination), by = "ID") |>
+  dplyr::mutate(
+    # Three-level exposure on the whole evaluated cohort: no alert, an alert
+    # into the reference state, an alert into any other state.
+    alert_type = dplyr::case_when(
+      !ever_alert                              ~ "no alert",
+      as.character(destination) == REF_STATE   ~ paste0("alert into ", REF_STATE),
+      TRUE                                     ~ "alert into another state"),
+    alert_type = factor(alert_type,
+      levels = c("no alert", paste0("alert into ", REF_STATE),
+                 "alert into another state"))) |>
+  dplyr::inner_join(covariates_pt, by = "ID")
+
+cat("Exposure groups:\n"); print(table(alert_dest$alert_type))
+cat("\nOrigin -> destination at the first alert:\n")
+print(table(origin = dest$origin, destination = dest$destination))
+
+# Mortality by destination among the alerted only.
+dest_tbl <- purrr::map_dfr(intersect(OUTCOME_COLS, names(alert_dest)), function(oc) {
+  alert_dest |>
+    dplyr::filter(ever_alert, !is.na(destination)) |>
+    dplyr::mutate(.y = as_binary(.data[[oc]])) |>
+    dplyr::filter(!is.na(.y)) |>
+    dplyr::group_by(destination) |>
+    dplyr::summarise(n = dplyr::n(), events = sum(.y),
+                     rate = round(mean(.y), 4), .groups = "drop") |>
+    dplyr::mutate(outcome = oc)
+}) |> dplyr::select(outcome, destination, n, events, rate)
+
+save_tab(dest_tbl, "tab46_14_mortality_by_alert_destination",
+         caption = "Mortality among alerted patients, by the state they moved into at the first alert.")
+
+# Three-level exposure, adjusted, on the whole evaluated cohort.
+dest_or <- purrr::map_dfr(intersect(OUTCOME_COLS, names(alert_dest)), function(oc) {
+  d <- alert_dest |>
+    dplyr::select(dplyr::all_of(c(oc, "alert_type", ADJUST_USE))) |>
+    tidyr::drop_na()
+  d[[oc]] <- as_binary(d[[oc]])
+  if (dplyr::n_distinct(d[[oc]]) < 2) return(NULL)
+  fit <- stats::glm(stats::reformulate(c("alert_type", ADJUST_USE),
+                                       response = oc),
+                    data = d, family = stats::binomial())
+  f0 <- stats::glm(stats::reformulate(ADJUST_USE, response = oc),
+                   data = d, family = stats::binomial())
+  a <- stats::anova(f0, fit, test = "LRT")
+  cat("\n--- ", oc, " ~ alert_type + covariates (n = ", nrow(d), ") ---\n", sep = "")
+  cat("LRT against covariates only: deviance = ", round(a$Deviance[2], 3),
+      ", df = ", a$Df[2], ", p = ",
+      format.pval(a[["Pr(>Chi)"]][2], digits = 4, eps = 1e-12), "\n", sep = "")
+  broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) |>
+    dplyr::filter(grepl("alert_type", term)) |>
+    dplyr::mutate(term = sub("^alert_type", "", term), outcome = oc,
+                  n = nrow(d), lrt_p = a[["Pr(>Chi)"]][2],
+                  cross_one = conf.low <= 1 & conf.high >= 1)
+})
+if (!is.null(dest_or) && nrow(dest_or) > 0)
+  save_tab(dest_or |> dplyr::select(outcome, term, estimate, conf.low,
+                                    conf.high, p.value, lrt_p, n) |>
+             dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 4))),
+           "tab46_15_alert_destination_odds_ratios",
+           caption = paste0("Odds ratios for the three-level alert exposure, ",
+                            "reference = no alert, adjusted for ",
+                            paste(ADJUST_USE, collapse = ", "), "."))
+```
+
+```{r alert-destination-fig, fig.width=9, fig.height=4.5}
+if (exists("dest_tbl") && nrow(dest_tbl) > 0) {
+  p_dest <- dest_tbl |>
+    dplyr::mutate(destination = factor(destination, levels = state_levels)) |>
+    ggplot(aes(destination, rate, fill = destination)) +
+    geom_col(width = 0.65) +
+    geom_text(aes(label = paste0(events, "/", n)), vjust = -0.4, size = 2.9) +
+    facet_wrap(~ outcome, scales = "free_y") +
+    scale_fill_manual(values = state_colours, guide = "none") +
+    scale_y_continuous(labels = scales::percent,
+                       expand = expansion(mult = c(0, 0.15))) +
+    labs(title = "Mortality among alerted patients, by destination state",
+         subtitle = "State entered at the first alert. Label = events / patients.",
+         x = NULL, y = "Crude rate") +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_dest)
+  save_fig(p_dest, "fig46_20_mortality_by_alert_destination", width = 9, height = 4.5)
+}
+```
+
+
+## 6.7 Stratification of the alerted patients: admission with infection
+
+The clinical question behind the alert is not only who moves, but which
+of the patients who move are at the greatest risk. The stratifying
+variable is whether the admission was coded with the infection reason
+(token `r INFECTION_CODE` of the pipe-separated `admission_reason`
+field). Note that no inflammatory marker enters the model: CRP is not
+part of the response set, so "admitted with an infection" is a
+documented reason for admission, not a biomarker-derived state.
+
+```{r infection-stratification}
+if (!"admission_infection" %in% names(strat)) {
+  cat("admission_reason not available; Section 6.7 skipped.\n")
+} else {
+  inf <- strat |> dplyr::filter(!is.na(admission_infection)) |>
+    dplyr::mutate(infection = factor(admission_infection, levels = c(0, 1),
+                                     labels = c("no infection code",
+                                                "infection code")),
+                  group = interaction(ever_alert, infection, sep = " / "))
+
+  cat("Alert x infection (n = ", nrow(inf), "):\n", sep = "")
+  tab_inf <- table(alerted = inf$ever_alert, infection = inf$infection)
+  print(tab_inf)
+  print(stats::fisher.test(tab_inf))
+
+  # Outcome by the four cells.
+  cell_tbl <- purrr::map_dfr(intersect(OUTCOME_COLS, names(inf)), function(oc) {
+    inf |>
+      dplyr::mutate(.y = as_binary(.data[[oc]])) |>
+      dplyr::filter(!is.na(.y)) |>
+      dplyr::group_by(alerted = ever_alert, infection) |>
+      dplyr::summarise(n = dplyr::n(), events = sum(.y),
+                       rate = round(mean(.y), 3), .groups = "drop") |>
+      dplyr::mutate(outcome = oc)
+  }) |>
+    dplyr::select(outcome, alerted, infection, n, events, rate)
+
+  save_tab(cell_tbl, "tab46_11_infection_cells",
+           caption = paste0("Outcome rate in the four cells defined by alert ",
+                            "status and admission with an infection code."))
+}
+```
+
+```{r infection-interaction}
+if ("admission_infection" %in% names(strat)) {
+  int_rows <- list()
+  for (oc in intersect(OUTCOME_COLS, names(strat))) {
+    d <- strat |>
+      dplyr::select(dplyr::all_of(c(oc, "ever_alert", "admission_infection",
+                                    intersect(ADJUST_COVARS, names(strat))))) |>
+      tidyr::drop_na()
+    d[[oc]] <- as_binary(d[[oc]])
+    if (dplyr::n_distinct(d[[oc]]) < 2) next
+
+    base_terms <- c("ever_alert * admission_infection",
+                    intersect(ADJUST_COVARS, names(d)))
+    fit_int  <- stats::glm(stats::reformulate(base_terms, response = oc),
+                           data = d, family = stats::binomial())
+    fit_main <- stats::glm(stats::reformulate(
+      c("ever_alert", "admission_infection", intersect(ADJUST_COVARS, names(d))),
+      response = oc), data = d, family = stats::binomial())
+    lrt <- stats::anova(fit_main, fit_int, test = "LRT")
+
+    cat("── ", oc, ": alert x infection interaction (n = ", nrow(d), ") ──\n",
+        sep = "")
+    print(as.data.frame(
+      broom::tidy(fit_int, exponentiate = TRUE, conf.int = TRUE) |>
+        dplyr::filter(term != "(Intercept)") |>
+        dplyr::select(term, estimate, conf.low, conf.high, p.value)),
+      digits = 4)
+    cat("Likelihood-ratio test for the interaction: deviance = ",
+        round(lrt$Deviance[2], 3), ", df = ", lrt$Df[2], ", p = ",
+        format.pval(lrt[["Pr(>Chi)"]][2], digits = 3, eps = 1e-4), "\n\n",
+        sep = "")
+
+    int_rows[[length(int_rows) + 1L]] <- tibble::tibble(
+      outcome = oc, n = nrow(d),
+      lrt_deviance = round(lrt$Deviance[2], 3), lrt_df = lrt$Df[2],
+      lrt_p = lrt[["Pr(>Chi)"]][2])
+  }
+  if (length(int_rows) > 0)
+    save_tab(dplyr::bind_rows(int_rows), "tab46_12_infection_interaction",
+             caption = "Likelihood-ratio test for the interaction between alerting and admission with an infection code.",
+             digits = 5)
+}
+```
+
+```{r infection-fig, fig.width=9, fig.height=4.5}
+if (exists("cell_tbl") && nrow(cell_tbl) > 0) {
+  p_inf <- cell_tbl |>
+    ggplot(aes(x = infection, y = rate, fill = alerted)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+    geom_text(aes(label = paste0(events, "/", n)),
+              position = position_dodge(width = 0.75), vjust = -0.35,
+              size = 2.9) +
+    facet_wrap(~ outcome, scales = "free_y") +
+    scale_fill_manual(values = c(`FALSE` = "grey70", `TRUE` = "#c0392b"),
+                      name = "Ever alerted") +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = "Mortality by alert status and admission with an infection code",
+         subtitle = "Label = events / patients in the cell.",
+         x = NULL, y = "Crude rate") +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9))
+  print(p_inf)
+  save_fig(p_inf, "fig46_16_infection_mortality", width = 9, height = 4.5)
+}
+```
+
+```{r infection-km, fig.width=10, fig.height=7}
+# Survival from admission across the four alert x infection cells.
+if ("admission_infection" %in% names(strat) &&
+    ADMISSION_DEATH_COL %in% names(df_full)) {
+  cells <- strat |>
+    dplyr::filter(!is.na(admission_infection)) |>
+    dplyr::transmute(
+      ID,
+      cell = factor(paste0(ifelse(ever_alert, "alert", "no alert"), " / ",
+                           ifelse(admission_infection == 1, "infection",
+                                  "no infection")))) |>
+    dplyr::inner_join(death_adm, by = "ID") |>
+    dplyr::mutate(
+      is_event = !is.na(days_to_death) & days_to_death >= 0L &
+                 days_to_death <= SURVIVAL_FOLLOWUP,
+      event = dplyr::if_else(is_event, 1L, 0L),
+      time  = dplyr::if_else(is_event, pmax(as.numeric(days_to_death), 0.5),
+                             as.numeric(SURVIVAL_FOLLOWUP))) |>
+    dplyr::select(-is_event)
+
+  fit_cells <- fit_km_one(cells, "cell")
+  run_logrank(cells, "cell", "alert x infection, admission-anchored")
+
+  g_cells <- survminer::ggsurvplot(
+    fit_cells, data = cells,
+    palette = c("grey55", "#1a6faf", "#d97706", "#c0392b"),
+    conf.int = FALSE, risk.table = TRUE, risk.table.height = 0.28,
+    pval = TRUE, pval.method = TRUE, break.time.by = 15,
+    xlim = c(0, SURVIVAL_FOLLOWUP),
+    xlab = "Days from admission", ylab = "Overall survival probability",
+    legend.title = "Group", legend.labs = levels(cells$cell),
+    ggtheme = theme_bw() + theme(plot.title = element_text(face = "bold")),
+    title = "Survival by alert status and admission with an infection code",
+    subtitle = paste0("Time origin = admission. All deaths within ",
+                      SURVIVAL_FOLLOWUP, " days are events."))
+  print(g_cells)
+  save_km_fig(g_cells, "fig46_17_km_infection_cells")
+}
+```
+
+```{r admission-reason-cooccurrence, fig.width=7, fig.height=6}
+# Context for the infection code: how the eleven admission reasons combine.
+if ("admission_reason" %in% names(strat)) {
+  codes <- as.character(1:11)
+  ar <- as.character(strat$admission_reason)
+  ind <- t(vapply(ar, function(s) {
+    if (is.na(s)) return(setNames(rep(NA_integer_, length(codes)), codes))
+    setNames(as.integer(codes %in% parse_reasons(s)), codes)
+  }, integer(length(codes))))
+  ind <- ind[stats::complete.cases(ind), , drop = FALSE]
+  colnames(ind) <- codes
+
+  cat("Patients used for co-occurrence: ", nrow(ind), "\n", sep = "")
+  prev <- tibble::tibble(code = codes, patients = as.integer(colSums(ind)))
+  save_tab(prev, "tab46_13_admission_reason_prevalence",
+           caption = "Prevalence of each admission-reason code.")
+
+  cooc <- crossprod(ind)
+  phi  <- suppressWarnings(stats::cor(ind))
+
+  phi_long <- as.data.frame(as.table(phi))
+  names(phi_long) <- c("code_i", "code_j", "phi")
+  phi_long$code_i <- factor(phi_long$code_i, levels = codes)
+  phi_long$code_j <- factor(phi_long$code_j, levels = rev(codes))
+
+  p_phi <- ggplot(phi_long, aes(code_i, code_j, fill = phi)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = ifelse(is.na(phi), "", sprintf("%.2f", phi))),
+              size = 2.6) +
+    scale_fill_gradient2(low = "#1a6faf", mid = "white", high = "#d73027",
+                         midpoint = 0, limits = c(-1, 1), na.value = "grey85",
+                         name = "phi") +
+    labs(title = "Admission-reason co-occurrence",
+         subtitle = "Binary correlation; phi > 0 means the two reasons appear together more than chance.",
+         x = "Code", y = "Code") +
+    theme_minimal(base_size = 9) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 8))
+  print(p_phi)
+  save_fig(p_phi, "fig46_18_admission_reason_phi", width = 7, height = 6)
+
+  cooc_long <- as.data.frame(as.table(cooc))
+  names(cooc_long) <- c("code_i", "code_j", "n")
+  cooc_long$code_i <- factor(cooc_long$code_i, levels = codes)
+  cooc_long$code_j <- factor(cooc_long$code_j, levels = rev(codes))
+
+  p_cooc <- ggplot(cooc_long, aes(code_i, code_j, fill = n)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = ifelse(is.na(n) | n == 0, "", n)), size = 2.6) +
+    scale_fill_gradient(low = "#fde0d9", high = "#c0392b", na.value = "grey85",
+                        name = "Patients") +
+    labs(title = "Admission-reason co-occurrence counts",
+         subtitle = "Cell = patients carrying both reasons; the diagonal is the prevalence.",
+         x = "Code", y = "Code") +
+    theme_minimal(base_size = 9) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 8))
+  print(p_cooc)
+  save_fig(p_cooc, "fig46_19_admission_reason_cooccurrence", width = 7, height = 6)
+}
+```
+
+\newpage
+
+# 7. Manifest of generated artefacts
+
+Every figure and table written by this run, for cross-checking against
+the Chapter 4 handoff block.
+
+```{r manifest}
+# The artefact name encodes its destination: tab4S_nn / fig4S_nn belongs to
+# Chapter 4 Section 4.S. The manifest makes that mapping explicit.
+section_of <- function(f) {
+  m <- regmatches(basename(f), regexpr("^(tab|fig)4[1-6]", basename(f)))
+  if (length(m) == 0) return(NA_character_)
+  paste0("4.", substr(m, 5, 5))
+}
+
+figs <- tibble::tibble(file = list.files(FIG_DIR, full.names = TRUE)) |>
+  dplyr::mutate(section = vapply(file, section_of, character(1)),
+                kb = round(file.info(file)$size / 1024, 1)) |>
+  dplyr::arrange(file)
+tabs <- tibble::tibble(file = list.files(TAB_DIR, full.names = TRUE)) |>
+  dplyr::mutate(section = vapply(file, section_of, character(1)),
+                kb = round(file.info(file)$size / 1024, 1)) |>
+  dplyr::arrange(file)
+
+print(knitr::kable(figs, caption = "Figures written by this run."))
+print(knitr::kable(tabs, caption = "Tables written by this run."))
+
+cat("\nFigures: ", nrow(figs), " files (PNG + PDF pairs). Tables: ",
+    nrow(tabs), " CSV files.\n", sep = "")
+```
+
+```{r session-info}
+cat("Cohort: ", dplyr::n_distinct(hmm_data$ID), " patients, ",
+    n_stayer, " stayers, ", n_switcher, " switchers.\n", sep = "")
+cat("Admission anchor: ", nrow(all_day0), " patients. Day-", DAY_TARGET,
+    " anchor: ", nrow(online_day7), " patients. Common subcohort: ",
+    length(common_ids), ".\n", sep = "")
+sessionInfo()
+```
